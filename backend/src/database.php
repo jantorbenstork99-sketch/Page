@@ -182,6 +182,79 @@ function appDatabase(): PDO
             'UPDATE products SET markup_basis_points = (SELECT markup_basis_points FROM product_settings WHERE id = 1)'
         );
     }
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS raw_materials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE,
+            unit TEXT NOT NULL COLLATE NOCASE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (name, unit),
+            CHECK (length(trim(name)) BETWEEN 1 AND 160),
+            CHECK (length(trim(unit)) BETWEEN 1 AND 24)
+        )'
+    );
+    $recipeTableExists = $database->query(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'product_recipe_components'"
+    )->fetchColumn() !== false;
+    if ($recipeTableExists) {
+        $recipeColumns = $database->query('PRAGMA table_info(product_recipe_components)')->fetchAll(PDO::FETCH_COLUMN, 1);
+    } else {
+        $recipeColumns = [];
+    }
+    if (!in_array('raw_material_id', $recipeColumns, true)) {
+        $database->beginTransaction();
+        try {
+            $legacyRecipes = [];
+            if ($recipeTableExists) {
+                $legacyRecipes = $database->query(
+                    'SELECT recipe.product_id, component.name, recipe.quantity_milliunits, recipe.unit
+                     FROM product_recipe_components AS recipe
+                     JOIN products AS component ON component.id = recipe.component_product_id'
+                )->fetchAll();
+                $database->exec('ALTER TABLE product_recipe_components RENAME TO product_recipe_components_legacy');
+            }
+            $database->exec(
+                'CREATE TABLE product_recipe_components (
+                    product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+                    raw_material_id INTEGER NOT NULL REFERENCES raw_materials(id) ON DELETE RESTRICT,
+                    quantity_milliunits INTEGER NOT NULL CHECK (quantity_milliunits > 0),
+                    PRIMARY KEY (product_id, raw_material_id)
+                )'
+            );
+            $findMaterial = $database->prepare(
+                'SELECT id FROM raw_materials WHERE name = :name COLLATE NOCASE AND unit = :unit COLLATE NOCASE'
+            );
+            $createMaterial = $database->prepare(
+                'INSERT INTO raw_materials (name, unit) VALUES (:name, :unit)'
+            );
+            $createRecipe = $database->prepare(
+                'INSERT INTO product_recipe_components (product_id, raw_material_id, quantity_milliunits)
+                 VALUES (:product_id, :raw_material_id, :quantity)'
+            );
+            foreach ($legacyRecipes as $legacyRecipe) {
+                $findMaterial->execute(['name' => $legacyRecipe['name'], 'unit' => $legacyRecipe['unit']]);
+                $materialId = $findMaterial->fetchColumn();
+                if ($materialId === false) {
+                    $createMaterial->execute(['name' => $legacyRecipe['name'], 'unit' => $legacyRecipe['unit']]);
+                    $materialId = $database->lastInsertId();
+                }
+                $createRecipe->execute([
+                    'product_id' => $legacyRecipe['product_id'],
+                    'raw_material_id' => $materialId,
+                    'quantity' => $legacyRecipe['quantity_milliunits'],
+                ]);
+            }
+            if ($recipeTableExists) {
+                $database->exec('DROP TABLE product_recipe_components_legacy');
+            }
+            $database->commit();
+        } catch (Throwable $recipeMigrationError) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $recipeMigrationError;
+        }
+    }
 
     $database->exec(
         'CREATE TABLE IF NOT EXISTS orders (

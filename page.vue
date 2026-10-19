@@ -8,6 +8,8 @@ const percentFormatter = new Intl.NumberFormat('de-DE', { minimumFractionDigits:
 const sections = [
   { id: 'overview', label: 'Übersicht', mark: 'Ü', permissions: ['inventory_view'] },
   { id: 'products', label: 'Produkte', mark: 'P', permissions: ['products_view', 'products_manage', 'product_markup_manage'] },
+  { id: 'materials', label: 'Rohstoffe', mark: 'R', permissions: ['products_manage'] },
+  { id: 'production', label: 'Produktionsrechner', mark: 'Σ', permissions: ['products_view', 'products_manage', 'product_markup_manage'] },
   { id: 'inventory', label: 'Lager', mark: 'L', permissions: ['inventory_view', 'inventory_manage', 'warehouses_manage'] },
   { id: 'orders', label: 'Bestellungen', mark: 'B', permissions: ['orders_manage'] },
   { id: 'cash', label: 'Kasse', mark: 'K', permissions: ['cash_manage'] },
@@ -43,12 +45,14 @@ function localDateString() {
 const session = ref(null)
 const csrfToken = ref('')
 const activeSection = ref('overview')
+const accountMenuOpen = ref(false)
 const username = ref('')
 const password = ref('')
 const employees = ref([])
 const roles = ref([])
 const warehouses = ref([])
 const products = ref([])
+const rawMaterials = ref([])
 const noticeSections = ref([])
 const notices = ref([])
 const noticeDrafts = ref({})
@@ -66,6 +70,8 @@ const balanceTransactions = ref([])
 const markupPercent = ref('20,00')
 const warehouseName = ref('')
 const productForm = ref({ name: '', purchasePrice: '' })
+const rawMaterialForm = ref({ name: '' })
+const editingRawMaterial = ref(null)
 const orderForm = ref({ customerName: '', customerPhone: '', groupingName: '' })
 const orderItems = ref([{ key: 1, productId: '', quantity: 1 }])
 const nextOrderLineKey = ref(2)
@@ -78,6 +84,8 @@ const savingEmployee = ref(false)
 const savingRole = ref(false)
 const savingWarehouse = ref(false)
 const savingProduct = ref(false)
+const savingRecipe = ref(false)
+const savingRawMaterial = ref(false)
 const savingNotice = ref(false)
 const savingNoticeSection = ref(false)
 const savingCash = ref(false)
@@ -108,7 +116,7 @@ const availableSections = computed(() =>
 )
 const navigationGroups = computed(() => [
   { label: '', sections: availableSections.value.filter(({ id }) => ['overview', 'inventory'].includes(id)) },
-  { label: 'Waffenbau', sections: availableSections.value.filter(({ id }) => ['products', 'orders'].includes(id)) },
+  { label: 'Waffenbau', sections: availableSections.value.filter(({ id }) => ['products', 'materials', 'production', 'orders'].includes(id)) },
   { label: 'Finanzen', sections: availableSections.value.filter(({ id }) => ['cash', 'balance'].includes(id)) },
   { label: 'Verwaltung', sections: availableSections.value.filter(({ id }) => ['team', 'roles'].includes(id)) },
 ].filter(({ sections: groupSections }) => groupSections.length > 0))
@@ -121,6 +129,19 @@ const orderTotalCents = computed(() => orderItems.value.reduce((sum, item) => {
   if (!product) return sum
   return sum + priceToCents(product.sellingPrice) * Number(item.quantity || 0)
 }, 0))
+const recipeProductId = ref('')
+const recipeComponents = ref([])
+const productionProductId = ref('')
+const productionQuantity = ref(1)
+const recipeProduct = computed(() => products.value.find(({ id }) => String(id) === recipeProductId.value) ?? null)
+const productionProduct = computed(() => products.value.find(({ id }) => String(id) === productionProductId.value) ?? null)
+const productionRequirements = computed(() => {
+  if (!productionProduct.value || !Number.isInteger(productionQuantity.value) || productionQuantity.value < 1) return []
+  return (productionProduct.value.recipe ?? []).map((component) => ({
+    ...component,
+    totalQuantity: Number(component.quantity) * productionQuantity.value,
+  }))
+})
 
 function priceToCents(value) {
   const [whole, fraction = ''] = String(value).replace(',', '.').split('.')
@@ -147,6 +168,10 @@ function formatPercent(value) {
   return percentFormatter.format(Number(String(value).replace(',', '.')))
 }
 
+function formatRecipeQuantity(value) {
+  return new Intl.NumberFormat('de-DE', { maximumFractionDigits: 3 }).format(value)
+}
+
 function defaultEmployeeRoleId() {
   return assignableRoles.value.find(({ id }) => id === 'employee')?.id ?? assignableRoles.value[0]?.id ?? ''
 }
@@ -163,6 +188,16 @@ function resolveDeleteConfirmation(confirmed) {
   deleteConfirmation.value = null
   deleteConfirmationResolver.value = null
   resolve?.(confirmed)
+}
+
+function toggleAccountMenu(event) {
+  accountMenuOpen.value = !accountMenuOpen.value
+  if (!accountMenuOpen.value) event.currentTarget.blur()
+}
+
+function closeAccountMenu(event) {
+  accountMenuOpen.value = false
+  event.currentTarget.querySelector('.account-trigger')?.blur()
 }
 
 async function request(path, options = {}) {
@@ -228,9 +263,11 @@ async function logout() {
     session.value = data.user
     csrfToken.value = data.csrfToken
     activeSection.value = 'overview'
+    accountMenuOpen.value = false
     employees.value = []
     roles.value = []
     products.value = []
+    rawMaterials.value = []
     noticeSections.value = []
     notices.value = []
     noticeDrafts.value = {}
@@ -342,11 +379,109 @@ async function saveWarehouseEntry(warehouse, member) {
 async function loadProducts() {
   try {
     const data = await request('/api/products')
+    const materialData = await request('/api/raw-materials')
     products.value = data.products.map((product) => ({
       ...product,
       markupPercent: product.markupPercent.replace('.', ','),
     }))
+    rawMaterials.value = materialData.materials
     markupPercent.value = data.markupPercent.replace('.', ',')
+    if (!products.value.some(({ id }) => String(id) === recipeProductId.value)) {
+      recipeProductId.value = String(products.value[0]?.id ?? '')
+    }
+    if (!products.value.some(({ id }) => String(id) === productionProductId.value)) {
+      productionProductId.value = String(products.value[0]?.id ?? '')
+    }
+    loadRecipeEditor()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+function loadRecipeEditor() {
+  recipeComponents.value = (recipeProduct.value?.recipe ?? []).map((component) => ({
+    rawMaterialId: String(component.rawMaterialId),
+    quantity: String(component.quantity).replace('.', ','),
+  }))
+}
+
+function addRecipeComponent() {
+  recipeComponents.value.push({ rawMaterialId: String(rawMaterials.value[0]?.id ?? ''), quantity: '1' })
+}
+
+function removeRecipeComponent(index) {
+  recipeComponents.value.splice(index, 1)
+}
+
+async function saveRecipe() {
+  if (!recipeProduct.value) return
+  error.value = ''
+  savingRecipe.value = true
+  try {
+    await request(`/api/products/${recipeProduct.value.id}/recipe`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        components: recipeComponents.value.map((component) => ({
+          rawMaterialId: Number(component.rawMaterialId),
+          quantity: component.quantity,
+        })),
+      }),
+    })
+    await loadProducts()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingRecipe.value = false
+  }
+}
+
+async function createRawMaterial() {
+  error.value = ''
+  savingRawMaterial.value = true
+  try {
+    await request('/api/raw-materials', {
+      method: 'POST',
+      body: JSON.stringify(rawMaterialForm.value),
+    })
+    rawMaterialForm.value = { name: '' }
+    await loadProducts()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingRawMaterial.value = false
+  }
+}
+
+function startEditingRawMaterial(material) {
+  editingRawMaterial.value = { ...material }
+}
+
+async function saveRawMaterial() {
+  if (!editingRawMaterial.value) return
+  error.value = ''
+  savingRawMaterial.value = true
+  try {
+    await request(`/api/raw-materials/${editingRawMaterial.value.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        name: editingRawMaterial.value.name,
+      }),
+    })
+    editingRawMaterial.value = null
+    await loadProducts()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingRawMaterial.value = false
+  }
+}
+
+async function deleteRawMaterial(material) {
+  if (!await confirmDelete(`Rohstoff „${material.name}“ löschen?`)) return
+  error.value = ''
+  try {
+    await request(`/api/raw-materials/${material.id}`, { method: 'DELETE' })
+    await loadProducts()
   } catch (requestError) {
     error.value = requestError.message
   }
@@ -754,7 +889,7 @@ watch([activeSection, session], ([section, user]) => {
   if (user && section === 'overview') loadNotices()
   if (section === 'team' || section === 'roles') loadTeam()
   if (section === 'inventory') loadWarehouses()
-  if (section === 'products') loadProducts()
+  if (['products', 'materials', 'production'].includes(section)) loadProducts()
   if (section === 'orders') loadOrders()
   if (section === 'cash') loadCashTransactions()
   if (section === 'balance') loadBalance()
@@ -763,6 +898,8 @@ watch([activeSection, session], ([section, user]) => {
 watch(roles, (items) => {
   if (!employeeForm.value.roleId && items.length) employeeForm.value.roleId = defaultEmployeeRoleId()
 }, { deep: true })
+
+watch(recipeProductId, loadRecipeEditor)
 
 onMounted(loadSession)
 </script>
@@ -844,21 +981,6 @@ onMounted(loadSession)
         </div>
       </nav>
 
-      <div class="sidebar-bottom">
-        <div class="help-card">
-          <span class="help-icon">?</span>
-          <strong>Fragen?</strong>
-          <span>Wende dich an deine Administration.</span>
-        </div>
-        <button class="profile-button" type="button" @click="logout">
-          <span class="avatar">{{ session.name.slice(0, 1).toLocaleUpperCase('de') }}</span>
-          <span class="profile-info">
-            <strong>{{ session.name }}</strong>
-            <span>{{ session.roleName }}</span>
-          </span>
-          <span class="logout-mark" aria-label="Abmelden">↗</span>
-        </button>
-      </div>
     </aside>
 
     <section class="main-panel">
@@ -866,7 +988,33 @@ onMounted(loadSession)
         <div class="breadcrumb">Arbeitsbereich <span>/</span> {{ currentSection?.label ?? 'Kein Zugriff' }}</div>
         <div class="topbar-right">
           <span class="topbar-date">{{ new Intl.DateTimeFormat('de-DE', { dateStyle: 'long' }).format(new Date()) }}</span>
-          <span class="avatar avatar-small">{{ session.name.slice(0, 1).toLocaleUpperCase('de') }}</span>
+          <div
+            class="account-menu"
+            :class="{ 'account-menu-open': accountMenuOpen }"
+            @mouseleave="accountMenuOpen = false"
+            @keydown.esc.stop="closeAccountMenu"
+          >
+            <button
+              class="account-trigger"
+              type="button"
+              aria-label="Kontomenü öffnen"
+              aria-haspopup="true"
+              :aria-expanded="accountMenuOpen"
+              @click="toggleAccountMenu"
+            >
+              <span class="avatar avatar-small">{{ session.name.slice(0, 1).toLocaleUpperCase('de') }}</span>
+            </button>
+            <div class="account-popover" role="group" aria-label="Konto">
+              <div class="account-details">
+                <strong>{{ session.name }}</strong>
+                <span>{{ session.roleName }}</span>
+              </div>
+              <button class="account-logout" type="button" @click="logout">
+                <span aria-hidden="true">↗</span>
+                Abmelden
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -1395,6 +1543,166 @@ onMounted(loadSession)
           </section>
         </template>
 
+        <template v-else-if="activeSection === 'materials' && canManageProducts">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">PRODUKTIONSVORBEREITUNG</p>
+              <h1>Rohstoffe</h1>
+              <p class="page-subtitle">Lege Rohstoffe an und ordne den Produkten die benötigte Menge pro Stück zu.</p>
+            </div>
+          </div>
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Rohstoff hinzufügen</h2>
+                <p>Rohstoffe sind unabhängig von der Produktliste und können anschließend Produkten zugeordnet werden.</p>
+              </div>
+            </div>
+            <form class="management-form raw-material-create-form" @submit.prevent="createRawMaterial">
+              <label>
+                Rohstoffname
+                <input v-model.trim="rawMaterialForm.name" maxlength="160" required />
+              </label>
+              <button class="management-button" type="submit" :disabled="savingRawMaterial">
+                {{ savingRawMaterial ? 'Wird gespeichert …' : 'Rohstoff hinzufügen' }}
+              </button>
+            </form>
+            <div v-if="rawMaterials.length" class="raw-material-list">
+              <article v-for="material in rawMaterials" :key="material.id" class="raw-material-item">
+                <template v-if="editingRawMaterial?.id === material.id">
+                  <label>
+                    Rohstoffname
+                    <input v-model.trim="editingRawMaterial.name" maxlength="160" required />
+                  </label>
+                  <div class="raw-material-actions">
+                    <button class="text-link" type="button" :disabled="savingRawMaterial" @click="saveRawMaterial">
+                      {{ savingRawMaterial ? 'Wird gespeichert …' : 'Speichern' }}
+                    </button>
+                    <button class="text-link" type="button" :disabled="savingRawMaterial" @click="editingRawMaterial = null">
+                      Abbrechen
+                    </button>
+                  </div>
+                </template>
+                <template v-else>
+                  <strong>{{ material.name }}</strong>
+                  <div class="raw-material-actions">
+                    <button class="text-link" type="button" @click="startEditingRawMaterial(material)">Bearbeiten</button>
+                    <button class="text-link role-delete" type="button" @click="deleteRawMaterial(material)">Löschen</button>
+                  </div>
+                </template>
+              </article>
+            </div>
+            <p v-else class="production-empty">Noch keine Rohstoffe angelegt.</p>
+          </section>
+          <section v-if="products.length" class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Rohstoffe einem Produkt zuordnen</h2>
+                <p>Trage ein, wie viel von jedem Rohstoff für ein Stück benötigt wird.</p>
+              </div>
+            </div>
+            <form class="management-form recipe-management-form" @submit.prevent="saveRecipe">
+              <label>
+                Hergestelltes Produkt
+                <select v-model="recipeProductId" required>
+                  <option v-for="product in products" :key="product.id" :value="String(product.id)">
+                    {{ product.name }}
+                  </option>
+                </select>
+              </label>
+              <div class="recipe-component-list">
+                <div v-for="(component, index) in recipeComponents" :key="index" class="recipe-component-row">
+                  <label>
+                    Rohstoff
+                    <select v-model="component.rawMaterialId" required>
+                      <option value="" disabled>Rohstoff auswählen</option>
+                      <option v-for="material in rawMaterials" :key="material.id" :value="String(material.id)">
+                        {{ material.name }}
+                      </option>
+                    </select>
+                  </label>
+                  <label>
+                    Menge je Stück
+                    <input
+                      v-model="component.quantity"
+                      type="text"
+                      inputmode="decimal"
+                      maxlength="10"
+                      pattern="[0-9]{1,6}([.,][0-9]{1,3})?"
+                      placeholder="z. B. 2,5"
+                      required
+                    />
+                  </label>
+                  <button class="text-link role-delete" type="button" @click="removeRecipeComponent(index)">Entfernen</button>
+                </div>
+                <p v-if="recipeComponents.length === 0" class="production-empty">
+                  Für dieses Produkt sind noch keine Rohstoffe zugeordnet.
+                </p>
+              </div>
+              <div class="recipe-form-actions">
+                <button
+                  class="secondary-button"
+                  type="button"
+                  :disabled="recipeComponents.length >= 50 || rawMaterials.length === 0"
+                  @click="addRecipeComponent"
+                >
+                  Rohstoff zuordnen
+                </button>
+                <button class="management-button" type="submit" :disabled="savingRecipe">
+                  {{ savingRecipe ? 'Wird gespeichert …' : 'Zuordnung speichern' }}
+                </button>
+              </div>
+            </form>
+          </section>
+          <p v-else class="production-empty">Lege zuerst ein Produkt im Menüpunkt „Produkte“ an.</p>
+        </template>
+
+        <template v-else-if="activeSection === 'production'">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">PRODUKTIONSPLANUNG</p>
+              <h1>Produktionsrechner</h1>
+              <p class="page-subtitle">Wähle ein Produkt und die gewünschte Stückzahl, um den Rohstoffbedarf zu berechnen.</p>
+            </div>
+          </div>
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Bedarf berechnen</h2>
+                <p>Die hinterlegte Rezeptur wird mit der Produktionsmenge multipliziert.</p>
+              </div>
+            </div>
+            <form class="management-form production-calculator" @submit.prevent>
+              <label>
+                Produkt
+                <select v-model="productionProductId" required>
+                  <option v-for="product in products" :key="product.id" :value="String(product.id)">
+                    {{ product.name }}
+                  </option>
+                </select>
+              </label>
+              <label>
+                Gewünschte Stückzahl
+                <input v-model.number="productionQuantity" type="number" min="1" max="999999" step="1" required />
+              </label>
+            </form>
+            <div v-if="productionProduct && productionProduct.recipe.length" class="production-result">
+              <h3>Rohstoffbedarf für {{ productionQuantity }} × {{ productionProduct.name }}:</h3>
+              <ul>
+                <li v-for="component in productionRequirements" :key="component.productId">
+                  <strong>{{ formatRecipeQuantity(component.totalQuantity) }}</strong>
+                  <span>{{ component.name }}</span>
+                </li>
+              </ul>
+            </div>
+            <p v-else-if="productionProduct" class="production-empty">
+              Für {{ productionProduct.name }} sind noch keine Rohstoffe hinterlegt.
+              <span v-if="canManageProducts">Füge diese im Menüpunkt „Rohstoffe“ hinzu.</span>
+            </p>
+            <p v-else class="production-empty">Lege zuerst Produkte an, um den Rechner zu verwenden.</p>
+          </section>
+        </template>
+
         <template v-else-if="activeSection === 'inventory'">
           <div class="page-heading">
             <div>
@@ -1885,25 +2193,46 @@ onMounted(loadSession)
 }
 
 .workspace {
-  display: grid;
   min-height: 100vh;
-  grid-template-columns: 252px minmax(0, 1fr);
   background: #080808;
 }
 
 .sidebar {
-  position: sticky;
-  top: 0;
+  position: fixed;
+  z-index: 10;
+  inset: 0 auto 0 0;
   display: flex;
+  width: 252px;
   height: 100vh;
+  height: 100dvh;
+  min-height: 0;
   flex-direction: column;
+  overflow: hidden;
   padding: 27px 17px 15px;
   border-right: 1px solid #e9ede8;
   background: #fff;
 }
 
-.sidebar-brand { margin: 0 0 52px 6px; font-size: 1.65rem; }
-.side-nav { display: grid; gap: 18px; }
+.sidebar-brand { flex: 0 0 auto; margin: 0 0 28px 6px; font-size: 1.65rem; }
+.side-nav {
+  display: grid;
+  min-height: 0;
+  flex: 1 1 auto;
+  align-content: start;
+  gap: 18px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 5px 14px 0;
+  margin-right: -5px;
+  scrollbar-color: #78957b transparent;
+  scrollbar-width: thin;
+  scroll-behavior: smooth;
+}
+.side-nav::-webkit-scrollbar { width: 5px; }
+.side-nav::-webkit-scrollbar-track { background: transparent; }
+.side-nav::-webkit-scrollbar-thumb { border-radius: 5px; background: #78957b; }
+.side-nav::-webkit-scrollbar-thumb:hover { background: #a6c1a8; }
 .nav-group { display: grid; gap: 5px; }
 .nav-group + .nav-group { padding-top: 13px; border-top: 1px solid rgb(255 255 255 / 20%); }
 .nav-group-label {
@@ -1936,38 +2265,29 @@ onMounted(loadSession)
 
 .nav-item:hover { background: #f6f8f3; color: #354a3b; }
 .nav-item-active { background: #eff4e8; color: #334937; font-weight: 700; }
-.sidebar-bottom { margin-top: auto; }
-.help-card { display: grid; grid-template-columns: 28px 1fr; align-items: center; gap: 4px 9px; margin: 0 2px 15px; padding: 13px 11px; border: 1px solid #edf0ea; border-radius: 9px; }
-.help-icon { display: grid; width: 25px; height: 25px; grid-row: span 2; place-items: center; border-radius: 50%; background: #f1f4eb; color: #697a5d; font-size: 0.77rem; font-weight: 700; }
-.help-card strong { color: #47564b; font-size: 0.75rem; }
-.help-card > span:last-child { color: #969f98; font-size: 0.65rem; line-height: 1.45; }
-
-.profile-button {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  gap: 10px;
-  padding: 12px 4px 4px;
-  border: 0;
-  border-top: 1px solid #edf0ea;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-
 .avatar { display: grid; width: 34px; height: 34px; flex: 0 0 auto; place-items: center; border-radius: 50%; background: #e7eee2; color: #526a50; font-size: 0.83rem; font-weight: 800; }
-.profile-info { display: grid; flex: 1; gap: 3px; }
-.profile-info strong { overflow: hidden; color: #34443a; font-size: 0.77rem; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.profile-info > span { color: #96a098; font-size: 0.68rem; }
-.logout-mark { color: #829087; font-size: 1rem; }
 
-.main-panel { min-width: 0; background: #080808; }
+.main-panel { min-width: 0; margin-left: 252px; background: #080808; }
 .topbar { display: flex; height: 65px; align-items: center; justify-content: space-between; padding: 0 clamp(22px, 4vw, 52px); border-bottom: 1px solid #e9ede8; background: #fff; }
 .breadcrumb { color: #98a19a; font-size: 0.76rem; }
 .breadcrumb span { padding: 0 7px; color: #c5ccc6; }
 .topbar-right { display: flex; align-items: center; gap: 16px; }
 .topbar-date { color: #8a958d; font-size: 0.74rem; }
+.account-menu { position: relative; z-index: 20; }
+.account-trigger { display: flex; align-items: center; gap: 5px; padding: 4px; border: 0; border-radius: 8px; background: transparent; color: #87948b; cursor: pointer; }
+.account-trigger:hover,
+.account-trigger:focus-visible { outline: 0; background: #252d26; color: #dce9d8; }
 .avatar-small { width: 31px; height: 31px; font-size: 0.75rem; }
+.account-popover { position: absolute; top: calc(100% + 7px); right: 0; display: grid; width: 210px; gap: 12px; padding: 13px; border: 1px solid #353d35; border-radius: 9px; background: #191d19; box-shadow: 0 12px 30px rgb(0 0 0 / 38%); opacity: 0; pointer-events: none; transform: translateY(-4px); transition: opacity 140ms ease, transform 140ms ease; }
+.account-menu:hover .account-popover,
+.account-menu:focus-within .account-popover,
+.account-menu-open .account-popover { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.account-details { display: grid; gap: 4px; padding: 2px 3px 10px; border-bottom: 1px solid #343a34; }
+.account-details strong { overflow: hidden; color: #f0f3ee; font-size: 0.78rem; text-overflow: ellipsis; white-space: nowrap; }
+.account-details span { color: #a5b0a6; font-size: 0.68rem; }
+.account-logout { display: flex; min-height: 36px; align-items: center; gap: 9px; padding: 0 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #e3e7e1; cursor: pointer; text-align: left; font: inherit; font-size: 0.75rem; }
+.account-logout:hover,
+.account-logout:focus-visible { outline: 0; border-color: #59403b; background: #342622; color: #f1b2a8; }
 
 .content { width: min(100%, 1240px); margin: 0 auto; padding: 38px clamp(22px, 4vw, 52px) 42px; }
 .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 27px; }
@@ -2022,15 +2342,17 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .confirmation-delete:hover { background: #bd574d; }
 
 @media (max-width: 900px) {
-  .workspace { grid-template-columns: 218px minmax(0, 1fr); }
+  .sidebar { width: 218px; }
+  .main-panel { margin-left: 218px; }
 }
 
 @media (max-width: 700px) {
   .workspace { display: block; }
-  .sidebar { position: static; width: 100%; height: auto; padding: 13px 15px 10px; border-right: 0; border-bottom: 1px solid #e9ede8; }
+  .sidebar { position: static; width: 100%; height: auto; min-height: 0; overflow: visible; padding: 13px 15px 10px; border-right: 0; border-bottom: 1px solid #e9ede8; }
+  .main-panel { margin-left: 0; }
   .sidebar-brand { margin: 0 0 13px 2px; }
-  .sidebar-bottom { display: none; }
-  .side-nav { display: flex; align-items: stretch; gap: 10px; overflow-x: auto; }
+  .side-nav { display: flex; min-height: auto; flex: 0 0 auto; align-items: stretch; gap: 10px; overflow-x: auto; overflow-y: hidden; padding: 0 0 4px; margin-right: 0; scrollbar-width: none; }
+  .side-nav::-webkit-scrollbar { display: none; }
   .nav-group { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
   .nav-group + .nav-group { padding-top: 0; padding-left: 10px; border-top: 0; border-left: 1px solid rgb(255 255 255 / 28%); }
   .nav-group-label { margin: 0 3px 0 0; padding: 0; font-size: 0.58rem; letter-spacing: 0.06em; }
@@ -2071,14 +2393,7 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .nav-item { color: #e0e9e1; }
 .nav-item:hover { background: rgb(255 255 255 / 12%); color: #fff; }
 .nav-item-active { background: #dce9d8; color: #2f4b36; font-weight: 700; }
-.help-card { border-color: rgb(255 255 255 / 20%); }
-.help-icon { background: #dce9d8; color: #35533c; }
-.help-card strong { color: #f0f5f0; }
-.help-card > span:last-child { color: #c4d3c6; }
-.profile-button { border-top-color: rgb(255 255 255 / 20%); }
 .avatar { background: #dce9d8; color: #35533c; }
-.profile-info strong { color: #f0f5f0; }
-.profile-info > span, .logout-mark { color: #c4d3c6; }
 
 .topbar {
   border-bottom-color: #292929;
@@ -2213,7 +2528,37 @@ td { border-top-color: #2d2d2d; color: #bbb; }
 .saved-order li { display: flex; justify-content: space-between; gap: 12px; color: #bbb; font-size: 0.74rem; }
 .saved-order li span { color: #ddd; white-space: nowrap; }
 .product-create-form { grid-template-columns: minmax(0, 2fr) minmax(180px, 1fr) auto; align-items: end; }
+.raw-material-create-form { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
 .markup-form { grid-template-columns: minmax(180px, 240px) auto; align-items: end; }
+.production-calculator { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.production-result { padding: 0 20px 20px; }
+.production-result h3 { margin: 0 0 12px; color: #e5e5e5; font-size: 0.82rem; }
+.production-result ul { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.production-result li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid #303030; border-radius: 7px; background: #101010; }
+.production-result li strong { color: #d4e9a9; font-size: 0.8rem; white-space: nowrap; }
+.production-result li span { color: #bbb; font-size: 0.75rem; text-align: right; }
+.production-empty { margin: 0; padding: 0 20px 20px; color: #999; font-size: 0.75rem; }
+.production-empty span { display: block; margin-top: 5px; color: #bbb; }
+.recipe-component-list { display: grid; gap: 10px; }
+.recipe-component-row { display: grid; grid-template-columns: minmax(170px, 1.5fr) minmax(160px, 1fr) auto; align-items: end; gap: 12px; padding: 12px; border: 1px solid #303030; border-radius: 8px; background: #101010; }
+.recipe-component-row label { display: grid; min-width: 0; gap: 7px; color: #c8c8c8; font-size: 0.75rem; font-weight: 650; }
+.recipe-component-row input,
+.recipe-component-row select { min-width: 0; height: 38px; padding: 0 10px; border: 1px solid #383838; border-radius: 7px; outline: 0; background: #0b0b0b; color: #ededed; font: inherit; font-size: 0.76rem; }
+.recipe-component-row input:focus,
+.recipe-component-row select:focus { border-color: #a8c879; }
+.recipe-component-row > button { min-height: 38px; }
+.recipe-form-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.recipe-form-actions button:disabled { cursor: not-allowed; opacity: 0.55; }
+.raw-material-list { display: grid; gap: 8px; padding: 0 20px 20px; }
+.raw-material-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 10px 12px; border: 1px solid #303030; border-radius: 7px; background: #101010; }
+.raw-material-item:has(label) { grid-template-columns: minmax(0, 1fr) auto; }
+.raw-material-item label { display: grid; min-width: 0; gap: 6px; color: #c8c8c8; font-size: 0.68rem; font-weight: 650; }
+.raw-material-item input { width: 100%; min-width: 0; height: 36px; padding: 0 9px; border: 1px solid #383838; border-radius: 6px; outline: 0; background: #0b0b0b; color: #ededed; font: inherit; font-size: 0.75rem; }
+.raw-material-item input:focus { border-color: #a8c879; }
+.raw-material-item strong { color: #e5e5e5; font-size: 0.77rem; }
+.raw-material-item span { color: #aaa; font-size: 0.72rem; }
+.raw-material-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.raw-material-actions button { min-height: 30px; white-space: nowrap; }
 .warehouse-create-form { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
 .management-button,
 .secondary-button {
@@ -2359,9 +2704,16 @@ td { border-top-color: #2d2d2d; color: #bbb; }
   .order-customer-fields,
   .order-line,
   .product-create-form,
+  .raw-material-create-form,
   .markup-form,
   .cash-form,
+  .production-calculator,
   .role-management { grid-template-columns: 1fr; }
+  .recipe-component-row { grid-template-columns: 1fr; }
+  .raw-material-item,
+  .raw-material-item:has(label) { grid-template-columns: minmax(0, 1fr) auto; }
+  .raw-material-item:has(label) { align-items: start; }
+  .raw-material-item:has(label) .raw-material-actions { grid-column: 1 / -1; }
   .cash-form > button { grid-column: auto; }
   .cash-entry { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
   .cash-entry-amount { justify-self: end; }

@@ -526,11 +526,27 @@ try {
                     markup_basis_points AS markupBasisPoints
              FROM products ORDER BY name COLLATE NOCASE, id'
         )->fetchAll();
+        $recipeRows = $database->query(
+            'SELECT recipe.product_id AS productId, material.id AS rawMaterialId,
+                    material.name AS name, recipe.quantity_milliunits AS quantityMilliunits
+             FROM product_recipe_components AS recipe
+             JOIN raw_materials AS material ON material.id = recipe.raw_material_id
+             ORDER BY material.name COLLATE NOCASE, material.id'
+        )->fetchAll();
+        $recipesByProduct = [];
+        foreach ($recipeRows as $recipe) {
+            $recipesByProduct[(int) $recipe['productId']][] = [
+                'rawMaterialId' => (int) $recipe['rawMaterialId'],
+                'name' => $recipe['name'],
+                'quantity' => formatScaledInteger((int) $recipe['quantityMilliunits'], 3),
+            ];
+        }
         $products = [];
         foreach ($productRows as $product) {
             $purchasePriceCents = (int) $product['purchasePriceCents'];
             $productMarkupBasisPoints = (int) $product['markupBasisPoints'];
             $product['id'] = (int) $product['id'];
+            $product['recipe'] = $recipesByProduct[$product['id']] ?? [];
             $product['purchasePrice'] = formatScaledInteger($purchasePriceCents, 2);
             $product['markupPercent'] = formatScaledInteger($productMarkupBasisPoints, 2);
             $product['sellingPrice'] = formatScaledInteger(
@@ -545,6 +561,166 @@ try {
             'products' => $products,
             'markupPercent' => formatScaledInteger($markupBasisPoints, 2),
         ]);
+    }
+
+    if ($path === '/api/raw-materials' && $method === 'GET') {
+        requirePermission($currentUser, 'products_view', 'products_manage', 'product_markup_manage');
+        $materials = $database->query(
+            'SELECT id, name FROM raw_materials ORDER BY name COLLATE NOCASE, id'
+        )->fetchAll();
+        foreach ($materials as &$material) {
+            $material['id'] = (int) $material['id'];
+        }
+        unset($material);
+        respond(['materials' => $materials]);
+    }
+
+    if ($path === '/api/raw-materials' && $method === 'POST') {
+        requirePermission($currentUser, 'products_manage');
+        verifyCsrfToken();
+        $body = requestBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        if (preg_match('/\A.{1,160}\z/us', $name) !== 1) {
+            respond(['error' => 'Bitte gib einen Rohstoffnamen mit höchstens 160 Zeichen ein.'], 422);
+        }
+        $existingMaterial = $database->prepare(
+            'SELECT id FROM raw_materials
+             WHERE name = :name COLLATE NOCASE'
+        );
+        $existingMaterial->execute(['name' => $name]);
+        if ($existingMaterial->fetchColumn() !== false) {
+            respond(['error' => 'Dieser Rohstoff ist bereits vorhanden.'], 409);
+        }
+        $createMaterial = $database->prepare('INSERT INTO raw_materials (name, unit) VALUES (:name, :unit)');
+        $createMaterial->execute(['name' => $name, 'unit' => 'Stück']);
+        respond([
+            'material' => [
+                'id' => (int) $database->lastInsertId(),
+                'name' => $name,
+            ],
+            'message' => 'Rohstoff wurde angelegt.',
+        ], 201);
+    }
+
+    if (preg_match('#^/api/raw-materials/(\d+)$#D', (string) $path, $materialMatch) === 1) {
+        requirePermission($currentUser, 'products_manage');
+        $materialId = (int) $materialMatch[1];
+
+        if ($method === 'PATCH') {
+            verifyCsrfToken();
+            $body = requestBody();
+            $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+            if (preg_match('/\A.{1,160}\z/us', $name) !== 1) {
+                respond(['error' => 'Bitte gib einen Rohstoffnamen mit höchstens 160 Zeichen ein.'], 422);
+            }
+            $existingMaterial = $database->prepare(
+                'SELECT id FROM raw_materials
+                 WHERE name = :name COLLATE NOCASE AND id <> :id'
+            );
+            $existingMaterial->execute(['name' => $name, 'id' => $materialId]);
+            if ($existingMaterial->fetchColumn() !== false) {
+                respond(['error' => 'Dieser Rohstoff ist bereits vorhanden.'], 409);
+            }
+            $updateMaterial = $database->prepare(
+                'UPDATE raw_materials SET name = :name WHERE id = :id'
+            );
+            $updateMaterial->execute(['name' => $name, 'id' => $materialId]);
+            if ($updateMaterial->rowCount() === 0) {
+                $materialExists = $database->prepare('SELECT 1 FROM raw_materials WHERE id = :id');
+                $materialExists->execute(['id' => $materialId]);
+                if ($materialExists->fetchColumn() === false) {
+                    respond(['error' => 'Rohstoff wurde nicht gefunden.'], 404);
+                }
+            }
+            respond(['message' => 'Rohstoff wurde aktualisiert.']);
+        }
+
+        if ($method === 'DELETE') {
+            verifyCsrfToken();
+            $materialExists = $database->prepare('SELECT 1 FROM raw_materials WHERE id = :id');
+            $materialExists->execute(['id' => $materialId]);
+            if ($materialExists->fetchColumn() === false) {
+                respond(['error' => 'Rohstoff wurde nicht gefunden.'], 404);
+            }
+            $recipeUsage = $database->prepare('SELECT COUNT(*) FROM product_recipe_components WHERE raw_material_id = :id');
+            $recipeUsage->execute(['id' => $materialId]);
+            if ((int) $recipeUsage->fetchColumn() > 0) {
+                respond(['error' => 'Der Rohstoff wird noch in Rezepturen verwendet. Entferne ihn zuerst aus allen Rezepturen.'], 409);
+            }
+            $deleteMaterial = $database->prepare('DELETE FROM raw_materials WHERE id = :id');
+            $deleteMaterial->execute(['id' => $materialId]);
+            respond(['message' => 'Rohstoff wurde gelöscht.']);
+        }
+    }
+
+    if (preg_match('#^/api/products/(\d+)/recipe$#D', (string) $path, $recipeProductMatch) === 1 && $method === 'PATCH') {
+        requirePermission($currentUser, 'products_manage');
+        verifyCsrfToken();
+        $productId = (int) $recipeProductMatch[1];
+        $productExists = $database->prepare('SELECT 1 FROM products WHERE id = :id');
+        $productExists->execute(['id' => $productId]);
+        if ($productExists->fetchColumn() === false) {
+            respond(['error' => 'Produkt wurde nicht gefunden.'], 404);
+        }
+
+        $body = requestBody();
+        $components = $body['components'] ?? null;
+        if (!is_array($components) || !array_is_list($components) || count($components) > 50) {
+            respond(['error' => 'Die Rezeptur muss eine Liste mit höchstens 50 Bestandteilen sein.'], 422);
+        }
+
+        $validatedComponents = [];
+        $seenMaterialIds = [];
+        $materialExists = $database->prepare('SELECT 1 FROM raw_materials WHERE id = :id');
+        foreach ($components as $component) {
+            if (!is_array($component)) {
+                respond(['error' => 'Bitte prüfe die Bestandteile der Rezeptur.'], 422);
+            }
+            $rawMaterialId = filter_var($component['rawMaterialId'] ?? null, FILTER_VALIDATE_INT);
+            $quantityMilliunits = decimalToScaledInteger($component['quantity'] ?? null, 6, 3);
+            if (
+                $rawMaterialId === false
+                || $rawMaterialId === null
+                || isset($seenMaterialIds[$rawMaterialId])
+                || $quantityMilliunits === null
+                || $quantityMilliunits < 1
+            ) {
+                respond(['error' => 'Bitte prüfe Rohstoff und Menge jedes Bestandteils.'], 422);
+            }
+            $materialExists->execute(['id' => $rawMaterialId]);
+            if ($materialExists->fetchColumn() === false) {
+                respond(['error' => 'Ein ausgewählter Rohstoff wurde nicht gefunden.'], 422);
+            }
+            $seenMaterialIds[$rawMaterialId] = true;
+            $validatedComponents[] = [
+                'rawMaterialId' => $rawMaterialId,
+                'quantity' => $quantityMilliunits,
+            ];
+        }
+
+        $database->beginTransaction();
+        try {
+            $deleteRecipe = $database->prepare('DELETE FROM product_recipe_components WHERE product_id = :product_id');
+            $deleteRecipe->execute(['product_id' => $productId]);
+            $insertComponent = $database->prepare(
+                'INSERT INTO product_recipe_components (product_id, raw_material_id, quantity_milliunits)
+                 VALUES (:product_id, :raw_material_id, :quantity)'
+            );
+            foreach ($validatedComponents as $component) {
+                $insertComponent->execute([
+                    'product_id' => $productId,
+                    'raw_material_id' => $component['rawMaterialId'],
+                    'quantity' => $component['quantity'],
+                ]);
+            }
+            $database->commit();
+        } catch (Throwable $recipeError) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $recipeError;
+        }
+        respond(['message' => 'Produktrezeptur wurde gespeichert.']);
     }
 
     if ($path === '/api/products/markup' && $method === 'PATCH') {
