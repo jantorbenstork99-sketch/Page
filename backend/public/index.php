@@ -113,9 +113,37 @@ function requirePermission(?array $user, string ...$permissions): array
     respond(['error' => 'Du hast keine Berechtigung für diese Aktion.'], 403);
 }
 
+function requireLogin(?array $user): array
+{
+    if ($user === null) {
+        respond(['error' => 'Bitte melde dich erneut an.'], 401);
+    }
+
+    return $user;
+}
+
 function validUsername(mixed $username): bool
 {
     return is_string($username) && preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$/', $username) === 1;
+}
+
+function validNoticeText(mixed $text, int $maxBytes): bool
+{
+    if (!is_string($text)) {
+        return false;
+    }
+
+    $text = trim($text);
+    return $text !== ''
+        && strlen($text) <= $maxBytes
+        && preg_match('/\A.{1,1000}\z/us', $text) === 1;
+}
+
+function validNoticeSectionName(mixed $name): bool
+{
+    return is_string($name)
+        && strlen(trim($name)) <= 240
+        && preg_match('/\A.{1,60}\z/us', trim($name)) === 1;
 }
 
 function validRolePermissions(mixed $permissions): bool
@@ -215,6 +243,156 @@ try {
 
     $sessionUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
     $currentUser = $sessionUserId === false || $sessionUserId === null ? null : publicUser($database, $sessionUserId);
+
+    if ($path === '/api/notices' && $method === 'GET') {
+        requireLogin($currentUser);
+        $noticeSections = $database->query(
+            'SELECT id, name, is_fixed AS isFixed FROM notice_sections ORDER BY is_fixed DESC, id'
+        )->fetchAll();
+        foreach ($noticeSections as &$noticeSection) {
+            $noticeSection['id'] = (int) $noticeSection['id'];
+            $noticeSection['isFixed'] = (bool) $noticeSection['isFixed'];
+        }
+        unset($noticeSection);
+        $notices = $database->query(
+            'SELECT id, section_id AS sectionId, author_id AS authorId, author_name AS authorName,
+                    body, created_at AS createdAt, updated_at AS updatedAt
+             FROM notices ORDER BY created_at DESC, id DESC'
+        )->fetchAll();
+        foreach ($notices as &$notice) {
+            $notice['id'] = (int) $notice['id'];
+            $notice['sectionId'] = (int) $notice['sectionId'];
+            $notice['authorId'] = $notice['authorId'] === null ? null : (int) $notice['authorId'];
+        }
+        unset($notice);
+        respond(['sections' => $noticeSections, 'notices' => $notices]);
+    }
+
+    if ($path === '/api/notices' && $method === 'POST') {
+        $user = requireLogin($currentUser);
+        verifyCsrfToken();
+        $body = requestBody();
+        $sectionId = $body['sectionId'] ?? null;
+        $noticeText = $body['body'] ?? null;
+        if (!is_int($sectionId) || $sectionId < 1 || !validNoticeText($noticeText, 4000)) {
+            respond(['error' => 'Bitte wähle einen Bereich und gib eine Nachricht mit höchstens 1000 Zeichen ein.'], 422);
+        }
+        $sectionCheck = $database->prepare('SELECT 1 FROM notice_sections WHERE id = :id');
+        $sectionCheck->execute(['id' => $sectionId]);
+        if ($sectionCheck->fetchColumn() === false) {
+            respond(['error' => 'Der Nachrichtenbereich wurde nicht gefunden.'], 404);
+        }
+        $createNotice = $database->prepare(
+            'INSERT INTO notices (section_id, author_id, author_name, body)
+             VALUES (:section_id, :author_id, :author_name, :body)'
+        );
+        $createNotice->execute([
+            'section_id' => $sectionId,
+            'author_id' => $user['id'],
+            'author_name' => $user['name'],
+            'body' => trim($noticeText),
+        ]);
+        respond(['notice' => ['id' => (int) $database->lastInsertId()], 'message' => 'Nachricht wurde veröffentlicht.'], 201);
+    }
+
+    if (preg_match('#^/api/notices/(\d+)$#D', (string) $path, $noticeMatch) === 1) {
+        $user = requireLogin($currentUser);
+        $noticeId = (int) $noticeMatch[1];
+        $noticeCheck = $database->prepare('SELECT author_id FROM notices WHERE id = :id');
+        $noticeCheck->execute(['id' => $noticeId]);
+        $noticeAuthorId = $noticeCheck->fetchColumn();
+        if ($noticeAuthorId === false) {
+            respond(['error' => 'Nachricht wurde nicht gefunden.'], 404);
+        }
+        $canManageNotices = in_array('notice_sections_manage', $user['permissions'], true);
+        if (!$canManageNotices && (int) $noticeAuthorId !== $user['id']) {
+            respond(['error' => 'Du kannst nur eigene Nachrichten bearbeiten oder löschen.'], 403);
+        }
+
+        if ($method === 'PATCH') {
+            verifyCsrfToken();
+            $body = requestBody();
+            $noticeText = $body['body'] ?? null;
+            if (!validNoticeText($noticeText, 4000)) {
+                respond(['error' => 'Die Nachricht darf nicht leer sein und höchstens 1000 Zeichen enthalten.'], 422);
+            }
+            $updateNotice = $database->prepare(
+                'UPDATE notices SET body = :body, updated_at = CURRENT_TIMESTAMP WHERE id = :id'
+            );
+            $updateNotice->execute(['body' => trim($noticeText), 'id' => $noticeId]);
+            respond(['message' => 'Nachricht wurde gespeichert.']);
+        }
+
+        if ($method === 'DELETE') {
+            verifyCsrfToken();
+            $deleteNotice = $database->prepare('DELETE FROM notices WHERE id = :id');
+            $deleteNotice->execute(['id' => $noticeId]);
+            respond(['message' => 'Nachricht wurde gelöscht.']);
+        }
+    }
+
+    if ($path === '/api/notice-sections' && $method === 'POST') {
+        requirePermission($currentUser, 'notice_sections_manage');
+        verifyCsrfToken();
+        $body = requestBody();
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        if (!validNoticeSectionName($name)) {
+            respond(['error' => 'Der Bereichsname muss zwischen 1 und 60 Zeichen lang sein.'], 422);
+        }
+        $nameCheck = $database->prepare('SELECT 1 FROM notice_sections WHERE name = :name COLLATE NOCASE');
+        $nameCheck->execute(['name' => $name]);
+        if ($nameCheck->fetchColumn() !== false) {
+            respond(['error' => 'Ein Bereich mit diesem Namen ist bereits vorhanden.'], 409);
+        }
+        $createSection = $database->prepare('INSERT INTO notice_sections (name) VALUES (:name)');
+        $createSection->execute(['name' => $name]);
+        respond(['section' => ['id' => (int) $database->lastInsertId(), 'name' => $name, 'isFixed' => false]], 201);
+    }
+
+    if (preg_match('#^/api/notice-sections/(\d+)$#D', (string) $path, $noticeSectionMatch) === 1) {
+        requirePermission($currentUser, 'notice_sections_manage');
+        $noticeSectionId = (int) $noticeSectionMatch[1];
+        $sectionCheck = $database->prepare('SELECT is_fixed FROM notice_sections WHERE id = :id');
+        $sectionCheck->execute(['id' => $noticeSectionId]);
+        $sectionIsFixed = $sectionCheck->fetchColumn();
+        if ($sectionIsFixed === false) {
+            respond(['error' => 'Nachrichtenbereich wurde nicht gefunden.'], 404);
+        }
+        if ((int) $sectionIsFixed === 1) {
+            respond(['error' => 'Der Bereich „Wichtige Informationen“ kann nicht umbenannt oder gelöscht werden.'], 409);
+        }
+
+        if ($method === 'PATCH') {
+            verifyCsrfToken();
+            $body = requestBody();
+            $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+            if (!validNoticeSectionName($name)) {
+                respond(['error' => 'Der Bereichsname muss zwischen 1 und 60 Zeichen lang sein.'], 422);
+            }
+            $nameCheck = $database->prepare(
+                'SELECT 1 FROM notice_sections WHERE name = :name COLLATE NOCASE AND id != :id'
+            );
+            $nameCheck->execute(['name' => $name, 'id' => $noticeSectionId]);
+            if ($nameCheck->fetchColumn() !== false) {
+                respond(['error' => 'Ein Bereich mit diesem Namen ist bereits vorhanden.'], 409);
+            }
+            $renameSection = $database->prepare('UPDATE notice_sections SET name = :name WHERE id = :id');
+            $renameSection->execute(['name' => $name, 'id' => $noticeSectionId]);
+            respond(['message' => 'Bereich wurde umbenannt.']);
+        }
+
+        if ($method === 'DELETE') {
+            verifyCsrfToken();
+            $noticeCount = $database->prepare('SELECT COUNT(*) FROM notices WHERE section_id = :id');
+            $noticeCount->execute(['id' => $noticeSectionId]);
+            if ((int) $noticeCount->fetchColumn() > 0) {
+                respond(['error' => 'Der Bereich enthält noch Nachrichten. Lösche diese zuerst, bevor du den Bereich entfernst.'], 409);
+            }
+            $deleteSection = $database->prepare('DELETE FROM notice_sections WHERE id = :id');
+            $deleteSection->execute(['id' => $noticeSectionId]);
+            respond(['message' => 'Bereich wurde gelöscht.']);
+        }
+    }
 
     if ($path === '/api/products' && $method === 'GET') {
         requirePermission($currentUser, 'products_view', 'products_manage', 'product_markup_manage');

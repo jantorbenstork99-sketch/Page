@@ -25,13 +25,7 @@ const permissionOptions = [
   { id: 'products_manage', label: 'Produkte hinzufügen, bearbeiten und löschen' },
   { id: 'product_markup_manage', label: 'Produkt-Aufschlag einstellen' },
   { id: 'orders_manage', label: 'Bestellungen verwalten' },
-]
-
-const inventory = [
-  { sku: 'ART-1042', name: 'Karton 30 × 20 cm', category: 'Verpackung', stock: 248, minimum: 80, location: 'A-01-03' },
-  { sku: 'ART-2081', name: 'Versandetiketten', category: 'Bürobedarf', stock: 36, minimum: 50, location: 'B-02-01' },
-  { sku: 'ART-3105', name: 'Luftpolsterfolie', category: 'Verpackung', stock: 124, minimum: 40, location: 'A-03-02' },
-  { sku: 'ART-4270', name: 'Klebeband transparent', category: 'Verpackung', stock: 18, minimum: 30, location: 'A-01-06' },
+  { id: 'notice_sections_manage', label: 'Nachrichtenbereiche verwalten und alle Nachrichten bearbeiten' },
 ]
 
 const session = ref(null)
@@ -43,6 +37,13 @@ const employees = ref([])
 const roles = ref([])
 const warehouses = ref([])
 const products = ref([])
+const noticeSections = ref([])
+const notices = ref([])
+const noticeDrafts = ref({})
+const editingNoticeSectionId = ref(null)
+const editingNoticeSectionName = ref('')
+const editingNoticeBodies = ref({})
+const newNoticeSectionName = ref('')
 const orderProducts = ref([])
 const savedOrders = ref([])
 const markupPercent = ref('20,00')
@@ -60,9 +61,13 @@ const savingEmployee = ref(false)
 const savingRole = ref(false)
 const savingWarehouse = ref(false)
 const savingProduct = ref(false)
+const savingNotice = ref(false)
+const savingNoticeSection = ref(false)
 const savingMarkup = ref(false)
 const savingRoleOrder = ref(false)
 const error = ref('')
+const deleteConfirmation = ref(null)
+const deleteConfirmationResolver = ref(null)
 const userPermissions = computed(() => session.value?.permissions ?? [])
 const can = (permission) => userPermissions.value.includes(permission)
 const canViewEmployees = computed(() => can('employees_view') || can('employees_manage'))
@@ -73,9 +78,12 @@ const canManageWarehouses = computed(() => can('warehouses_manage'))
 const canEditWarehouseEntries = computed(() => can('inventory_manage'))
 const canManageProducts = computed(() => can('products_manage'))
 const canManageProductMarkup = computed(() => can('product_markup_manage'))
+const canManageNoticeSections = computed(() => can('notice_sections_manage'))
 const assignableRoles = computed(() => roles.value.filter((role) => role.assignable))
 const availableSections = computed(() =>
-  sections.filter((section) => section.permissions.some((permission) => can(permission))),
+  sections.filter((section) =>
+    section.id === 'overview' || section.permissions.some((permission) => can(permission)),
+  ),
 )
 const currentSection = computed(() =>
   availableSections.value.find(({ id }) => id === activeSection.value) ?? availableSections.value[0],
@@ -106,6 +114,20 @@ function formatPercent(value) {
 
 function defaultEmployeeRoleId() {
   return assignableRoles.value.find(({ id }) => id === 'employee')?.id ?? assignableRoles.value[0]?.id ?? ''
+}
+
+function confirmDelete(message) {
+  deleteConfirmation.value = message
+  return new Promise((resolve) => {
+    deleteConfirmationResolver.value = resolve
+  })
+}
+
+function resolveDeleteConfirmation(confirmed) {
+  const resolve = deleteConfirmationResolver.value
+  deleteConfirmation.value = null
+  deleteConfirmationResolver.value = null
+  resolve?.(confirmed)
 }
 
 async function request(path, options = {}) {
@@ -174,6 +196,13 @@ async function logout() {
     employees.value = []
     roles.value = []
     products.value = []
+    noticeSections.value = []
+    notices.value = []
+    noticeDrafts.value = {}
+    editingNoticeBodies.value = {}
+    editingNoticeSectionId.value = null
+    editingNoticeSectionName.value = ''
+    newNoticeSectionName.value = ''
     warehouses.value = []
     orderProducts.value = []
     savedOrders.value = []
@@ -249,7 +278,7 @@ async function renameWarehouse(warehouse) {
 }
 
 async function deleteWarehouse(warehouse) {
-  if (!window.confirm(`Lager „${warehouse.name}“ und alle zugehörigen Einträge löschen?`)) return
+  if (!await confirmDelete(`Lager „${warehouse.name}“ und alle zugehörigen Einträge löschen?`)) return
   error.value = ''
   try {
     await request(`/api/warehouses/${warehouse.id}`, { method: 'DELETE' })
@@ -315,7 +344,7 @@ async function saveProduct(product) {
 }
 
 async function deleteProduct(product) {
-  if (!window.confirm(`Produkt „${product.name}“ löschen?`)) return
+  if (!await confirmDelete(`Produkt „${product.name}“ löschen?`)) return
   error.value = ''
   try {
     await request(`/api/products/${product.id}`, { method: 'DELETE' })
@@ -362,6 +391,118 @@ async function loadOrders() {
   } catch (requestError) {
     error.value = requestError.message
   }
+}
+
+async function loadNotices() {
+  try {
+    const data = await request('/api/notices')
+    noticeSections.value = data.sections
+    notices.value = data.notices
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function createNotice(section) {
+  error.value = ''
+  savingNotice.value = true
+  try {
+    await request('/api/notices', {
+      method: 'POST',
+      body: JSON.stringify({ sectionId: section.id, body: noticeDrafts.value[section.id] ?? '' }),
+    })
+    noticeDrafts.value[section.id] = ''
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingNotice.value = false
+  }
+}
+
+function startEditingNotice(notice) {
+  editingNoticeBodies.value[notice.id] = notice.body
+}
+
+async function saveNotice(notice) {
+  error.value = ''
+  try {
+    await request(`/api/notices/${notice.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ body: editingNoticeBodies.value[notice.id] }),
+    })
+    delete editingNoticeBodies.value[notice.id]
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+function cancelEditingNotice(notice) {
+  delete editingNoticeBodies.value[notice.id]
+}
+
+async function deleteNotice(notice) {
+  if (!await confirmDelete('Diese Nachricht löschen?')) return
+  error.value = ''
+  try {
+    await request(`/api/notices/${notice.id}`, { method: 'DELETE' })
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function createNoticeSection() {
+  error.value = ''
+  savingNoticeSection.value = true
+  try {
+    await request('/api/notice-sections', {
+      method: 'POST',
+      body: JSON.stringify({ name: newNoticeSectionName.value }),
+    })
+    newNoticeSectionName.value = ''
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingNoticeSection.value = false
+  }
+}
+
+function startRenamingNoticeSection(section) {
+  editingNoticeSectionId.value = section.id
+  editingNoticeSectionName.value = section.name
+}
+
+async function saveNoticeSection(section) {
+  error.value = ''
+  try {
+    await request(`/api/notice-sections/${section.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name: editingNoticeSectionName.value }),
+    })
+    editingNoticeSectionId.value = null
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function deleteNoticeSection(section) {
+  if (!await confirmDelete(`Bereich „${section.name}“ löschen? Er muss dafür leer sein.`)) return
+  error.value = ''
+  try {
+    await request(`/api/notice-sections/${section.id}`, { method: 'DELETE' })
+    await loadNotices()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+function formatNoticeDate(value) {
+  return new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium', timeStyle: 'short' })
+    .format(new Date(value.replace(' ', 'T') + 'Z'))
 }
 
 function addOrderLine() {
@@ -473,6 +614,7 @@ async function saveRole() {
 }
 
 async function deleteRole(role) {
+  if (!await confirmDelete(`Rolle „${role.name}“ löschen?`)) return
   error.value = ''
   try {
     await request(`/api/roles/${encodeURIComponent(role.id)}`, { method: 'DELETE' })
@@ -499,7 +641,8 @@ async function saveEmployee(employee) {
   }
 }
 
-watch(activeSection, (section) => {
+watch([activeSection, session], ([section, user]) => {
+  if (user && section === 'overview') loadNotices()
   if (section === 'team' || section === 'roles') loadTeam()
   if (section === 'inventory') loadWarehouses()
   if (section === 'products') loadProducts()
@@ -622,67 +765,92 @@ onMounted(loadSession)
         </div>
 
         <template v-if="activeSection === 'overview'">
-          <div class="page-heading">
-            <div>
-              <p class="eyebrow">MONTAG · DEIN ÜBERBLICK</p>
-              <h1>Guten Tag, {{ session.name.split(' ')[0] }} <span class="wave">✳</span></h1>
-              <p class="page-subtitle">Hier ist, was heute in deinem Lager passiert.</p>
-            </div>
-            <span class="demo-tag"><span></span> DEMO-ANSICHT</span>
-          </div>
-
-          <section class="stats-grid" aria-label="Lagerkennzahlen">
-            <article class="stat-card">
-              <span class="stat-label">Artikel im Lager</span>
-              <span class="stat-number">1.284</span>
-              <span class="stat-foot"><span class="stat-accent">↑ 12</span> zum Vormonat</span>
-              <span class="stat-symbol symbol-violet">L</span>
-            </article>
-            <article class="stat-card">
-              <span class="stat-label">Offene Bestellungen</span>
-              <span class="stat-number">36</span>
-              <span class="stat-foot">8 davon heute fällig</span>
-              <span class="stat-symbol symbol-orange">B</span>
-            </article>
-            <article class="stat-card">
-              <span class="stat-label">Niedriger Bestand</span>
-              <span class="stat-number">4</span>
-              <span class="stat-foot"><span class="stat-warning">Aufmerksamkeit nötig</span></span>
-              <span class="stat-symbol symbol-pink">!</span>
-            </article>
-          </section>
-
-          <section class="panel-card overview-inventory">
-            <div class="panel-heading">
+          <section class="notice-board" aria-label="Nachrichten">
+            <div class="notice-board-heading">
               <div>
-                <h2>Lagerbestand</h2>
-                <p>Artikel, die zuletzt Aufmerksamkeit benötigen</p>
+                <h2>Nachrichten</h2>
+                <p>Wichtige Hinweise und Neuigkeiten für alle Mitglieder.</p>
               </div>
-              <button class="text-link" type="button" @click="activeSection = 'inventory'">
-                Zum Lager <span aria-hidden="true">→</span>
-              </button>
             </div>
-            <div class="table-scroll">
-              <table>
-                <thead>
-                  <tr><th>ARTIKEL</th><th>ARTIKEL-NR.</th><th>LAGERPLATZ</th><th>BESTAND</th><th>STATUS</th></tr>
-                </thead>
-                <tbody>
-                  <tr v-for="item in inventory.slice(0, 3)" :key="item.sku">
-                    <td class="product-name">{{ item.name }}<span>{{ item.category }}</span></td>
-                    <td>{{ item.sku }}</td>
-                    <td>{{ item.location }}</td>
-                    <td>{{ item.stock }} Stk.</td>
-                    <td><span class="stock-status" :class="item.stock < item.minimum ? 'status-low' : 'status-good'">
-                      <span></span>{{ item.stock < item.minimum ? 'Niedrig' : 'Auf Lager' }}
-                    </span></td>
-                  </tr>
-                </tbody>
-              </table>
+            <form v-if="canManageNoticeSections" class="notice-section-create" @submit.prevent="createNoticeSection">
+              <input
+                v-model.trim="newNoticeSectionName"
+                aria-label="Name des neuen Nachrichtenbereichs"
+                placeholder="Neuen Bereich benennen"
+                maxlength="60"
+                required
+              />
+              <button class="secondary-button" type="submit" :disabled="savingNoticeSection">
+                {{ savingNoticeSection ? 'Wird erstellt …' : 'Bereich hinzufügen' }}
+              </button>
+            </form>
+            <div class="notice-grid">
+              <article
+                v-for="section in noticeSections"
+                :key="section.id"
+                class="notice-card"
+                :class="{ 'notice-card-important': section.isFixed }"
+              >
+                <header class="notice-card-heading">
+                  <template v-if="editingNoticeSectionId === section.id">
+                    <form class="notice-rename-form" @submit.prevent="saveNoticeSection(section)">
+                      <input v-model.trim="editingNoticeSectionName" maxlength="60" required aria-label="Bereichsname" />
+                      <button class="text-link" type="submit">Speichern</button>
+                      <button class="text-link" type="button" @click="editingNoticeSectionId = null">Abbrechen</button>
+                    </form>
+                  </template>
+                  <template v-else>
+                    <h3>{{ section.name }}</h3>
+                    <div v-if="canManageNoticeSections && !section.isFixed" class="notice-section-actions">
+                      <button class="text-link" type="button" @click="startRenamingNoticeSection(section)">Umbenennen</button>
+                      <button class="text-link role-delete" type="button" @click="deleteNoticeSection(section)">Löschen</button>
+                    </div>
+                  </template>
+                </header>
+
+                <div class="notice-list">
+                  <article v-for="notice in notices.filter((item) => item.sectionId === section.id)" :key="notice.id" class="notice-entry">
+                    <div class="notice-entry-meta">
+                      <strong>{{ notice.authorName }}</strong>
+                      <time :datetime="notice.createdAt.replace(' ', 'T') + 'Z'">{{ formatNoticeDate(notice.createdAt) }}</time>
+                    </div>
+                    <template v-if="Object.hasOwn(editingNoticeBodies, notice.id)">
+                      <textarea v-model="editingNoticeBodies[notice.id]" maxlength="1000" rows="4" aria-label="Nachricht bearbeiten"></textarea>
+                      <div class="notice-entry-actions">
+                        <button class="text-link" type="button" @click="saveNotice(notice)">Speichern</button>
+                        <button class="text-link" type="button" @click="cancelEditingNotice(notice)">Abbrechen</button>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <p>{{ notice.body }}</p>
+                      <div v-if="canManageNoticeSections || notice.authorId === session.id" class="notice-entry-actions">
+                        <button class="text-link" type="button" @click="startEditingNotice(notice)">Bearbeiten</button>
+                        <button class="text-link role-delete" type="button" @click="deleteNotice(notice)">Löschen</button>
+                      </div>
+                    </template>
+                  </article>
+                  <p v-if="!notices.some((item) => item.sectionId === section.id)" class="notice-empty">
+                    Noch keine Nachrichten in diesem Bereich.
+                  </p>
+                </div>
+
+                <form class="notice-compose" @submit.prevent="createNotice(section)">
+                  <label :for="`notice-${section.id}`">Nachricht schreiben</label>
+                  <textarea
+                    :id="`notice-${section.id}`"
+                    v-model="noticeDrafts[section.id]"
+                    maxlength="1000"
+                    rows="3"
+                    placeholder="Teile eine Information mit allen …"
+                    required
+                  ></textarea>
+                  <button class="management-button" type="submit" :disabled="savingNotice">
+                    {{ savingNotice ? 'Wird veröffentlicht …' : 'Veröffentlichen' }}
+                  </button>
+                </form>
+              </article>
             </div>
           </section>
-
-          <p class="demo-note">Die Kennzahlen und Artikel in dieser Vorschau sind Beispieldaten.</p>
         </template>
 
         <template v-else-if="activeSection === 'orders'">
@@ -1262,6 +1430,30 @@ onMounted(loadSession)
       </div>
     </section>
   </main>
+
+  <div
+    v-if="deleteConfirmation"
+    class="confirmation-overlay"
+    role="presentation"
+    @click.self="resolveDeleteConfirmation(false)"
+    @keydown.esc.prevent.stop="resolveDeleteConfirmation(false)"
+  >
+    <section
+      class="confirmation-dialog"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="delete-confirmation-title"
+      aria-describedby="delete-confirmation-message"
+    >
+      <span class="confirmation-icon" aria-hidden="true">!</span>
+      <h2 id="delete-confirmation-title">Löschen bestätigen</h2>
+      <p id="delete-confirmation-message">{{ deleteConfirmation }}</p>
+      <div class="confirmation-actions">
+        <button class="secondary-button" type="button" autofocus @click="resolveDeleteConfirmation(false)">Abbrechen</button>
+        <button class="management-button confirmation-delete" type="button" @click="resolveDeleteConfirmation(true)">Löschen</button>
+      </div>
+    </section>
+  </div>
 </template>
 
 <style scoped>
@@ -1488,18 +1680,6 @@ onMounted(loadSession)
 .demo-tag { display: inline-flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid #e5eadf; border-radius: 7px; background: #fff; color: #869181; font-size: 0.59rem; font-weight: 800; letter-spacing: 0.09em; white-space: nowrap; }
 .demo-tag > span { width: 6px; height: 6px; border-radius: 50%; background: #a8bf6e; }
 
-.stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; margin-bottom: 22px; }
-.stat-card { position: relative; display: grid; min-height: 143px; align-content: start; gap: 13px; overflow: hidden; padding: 20px; border: 1px solid #e9ede7; border-radius: 10px; background: #fff; }
-.stat-label { color: #768279; font-size: 0.75rem; }
-.stat-number { color: #26382c; font-size: 2rem; font-weight: 650; letter-spacing: -0.06em; line-height: 1; }
-.stat-foot { color: #9aa39c; font-size: 0.68rem; }
-.stat-accent { color: #637f47; font-weight: 700; }
-.stat-warning { color: #ba7b38; }
-.stat-symbol { position: absolute; top: 17px; right: 17px; display: grid; width: 31px; height: 31px; place-items: center; border-radius: 9px; font-size: 0.72rem; font-weight: 800; }
-.symbol-violet { background: #f0edf8; color: #8577ae; }
-.symbol-orange { background: #faf0e7; color: #bf8a5b; }
-.symbol-pink { background: #f9ece9; color: #c27c6b; }
-
 .panel-card { overflow: hidden; border: 1px solid #e8ece6; border-radius: 10px; background: #fff; }
 .panel-heading { display: flex; min-height: 83px; align-items: center; justify-content: space-between; gap: 16px; padding: 17px 20px; }
 .panel-heading h2 { display: flex; align-items: center; gap: 10px; margin: 0; color: #35463a; font-size: 0.9rem; font-weight: 700; }
@@ -1519,8 +1699,6 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .status-good > span { background: #8bab69; }
 .status-low { color: #bd7c39; }
 .status-low > span { background: #d39c5e; }
-.demo-note { margin: 12px 0 0; color: #a3aba4; font-size: 0.68rem; }
-
 .inventory-panel .panel-heading { min-height: 91px; }
 .result-count { display: grid; min-width: 22px; height: 22px; place-items: center; border-radius: 12px; background: #f1f4eb; color: #738365; font-size: 0.65rem; }
 .search-field { display: flex; width: min(100%, 235px); height: 37px; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #e9ede7; border-radius: 7px; color: #869188; }
@@ -1536,11 +1714,17 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .module-placeholder > p:not(.eyebrow) { max-width: 440px; margin: 10px 0 20px; color: #909a92; font-size: 0.85rem; line-height: 1.6; }
 .notice-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; padding: 12px 14px; border: 1px solid #f0d7d3; border-radius: 8px; background: #fff8f6; color: #a8473e; font-size: 0.83rem; }
 .notice-error button { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 1.15rem; }
+.confirmation-overlay { position: fixed; inset: 0; z-index: 20; display: grid; padding: 20px; place-items: center; background: rgb(0 0 0 / 68%); }
+.confirmation-dialog { width: min(100%, 420px); padding: 24px; border: 1px solid #414141; border-radius: 12px; background: #171717; box-shadow: 0 24px 80px rgb(0 0 0 / 55%); }
+.confirmation-icon { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid #66443e; border-radius: 50%; background: #392622; color: #f0a69e; font-weight: 800; }
+.confirmation-dialog h2 { margin: 17px 0 8px; color: #f0f0f0; font-size: 1.05rem; }
+.confirmation-dialog p { margin: 0; color: #bcbcbc; font-size: 0.82rem; line-height: 1.55; }
+.confirmation-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 24px; }
+.confirmation-delete { background: #a8473e; color: #fff; }
+.confirmation-delete:hover { background: #bd574d; }
 
 @media (max-width: 900px) {
   .workspace { grid-template-columns: 218px minmax(0, 1fr); }
-  .stats-grid { gap: 10px; }
-  .stat-card { padding: 16px; }
 }
 
 @media (max-width: 700px) {
@@ -1555,8 +1739,7 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
   .content { padding: 27px 17px; }
   .page-heading { align-items: flex-start; }
   .page-heading > .demo-tag { margin-top: 3px; }
-  .stats-grid { grid-template-columns: 1fr; gap: 9px; }
-  .stat-card { min-height: 115px; gap: 9px; }
+
   .panel-heading { align-items: flex-start; }
   .inventory-panel .panel-heading { flex-direction: column; }
   .search-field { width: 100%; }
@@ -1613,19 +1796,12 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .demo-tag { border-color: #383838; background: #181818; color: #bbb; }
 .demo-tag > span { background: #b4d66e; }
 
-.stat-card, .panel-card {
+.panel-card {
   border-color: #303030;
   background: #141414;
 }
 
-.stat-label { color: #b5b5b5; }
-.stat-number { color: #f2f2f2; }
-.stat-foot, .panel-heading p, .demo-note { color: #a0a0a0; }
-.stat-accent { color: #b9d68a; }
-.stat-warning { color: #e1ae72; }
-.symbol-violet { background: #302b40; color: #c0b4e3; }
-.symbol-orange { background: #3c2e23; color: #e7b17b; }
-.symbol-pink { background: #3c2928; color: #e3a098; }
+.panel-heading p { color: #a0a0a0; }
 .panel-heading h2 { color: #e5e5e5; }
 .text-link { color: #c0d99d; }
 thead { background: #1d1d1d; }
@@ -1814,6 +1990,53 @@ td { border-top-color: #2d2d2d; color: #bbb; }
 .rank-actions { display: flex; gap: 6px; }
 .rank-button { width: 32px; min-height: 30px; padding: 0; }
 .rank-button:disabled { cursor: not-allowed; opacity: 0.4; }
+.notice-board { margin-bottom: 22px; }
+.notice-board-heading { margin-bottom: 12px; }
+.notice-board-heading h2 { margin: 0; color: #e5e5e5; font-size: 1rem; }
+.notice-board-heading p { margin: 5px 0 0; color: #a0a0a0; font-size: 0.75rem; }
+.notice-section-create { display: flex; gap: 8px; margin-bottom: 12px; }
+.notice-section-create input,
+.notice-rename-form input,
+.notice-compose textarea,
+.notice-entry textarea {
+  min-width: 0;
+  border: 1px solid #383838;
+  border-radius: 7px;
+  outline: 0;
+  background: #0b0b0b;
+  color: #ededed;
+  font: inherit;
+  font-size: 0.75rem;
+}
+.notice-section-create input { width: min(100%, 280px); height: 38px; padding: 0 10px; }
+.notice-section-create input:focus,
+.notice-rename-form input:focus,
+.notice-compose textarea:focus,
+.notice-entry textarea:focus { border-color: #a8c879; }
+.notice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.notice-card { min-width: 0; padding: 15px; border: 1px solid #303030; border-radius: 9px; background: #141414; }
+.notice-card-important { border-color: #596c42; background: #191e16; }
+.notice-card-heading { display: flex; min-height: 30px; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.notice-card-heading h3 { margin: 0; color: #e7e7e7; font-size: 0.85rem; }
+.notice-card-important .notice-card-heading h3 { color: #d7e7bf; }
+.notice-section-actions,
+.notice-entry-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.notice-section-actions { justify-content: flex-end; }
+.notice-rename-form { display: flex; width: 100%; align-items: center; flex-wrap: wrap; gap: 8px; }
+.notice-rename-form input { flex: 1; height: 34px; padding: 0 8px; }
+.notice-list { display: grid; gap: 9px; }
+.notice-entry { padding: 10px; border: 1px solid #2d2d2d; border-radius: 7px; background: #101010; }
+.notice-entry-meta { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.notice-entry-meta strong { color: #d7e7bf; font-size: 0.7rem; }
+.notice-entry-meta time { color: #858585; font-size: 0.62rem; }
+.notice-entry > p { margin: 8px 0; color: #d0d0d0; font-size: 0.75rem; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.notice-entry textarea,
+.notice-compose textarea { display: block; width: 100%; min-height: 65px; resize: vertical; padding: 9px; line-height: 1.45; }
+.notice-entry textarea { margin: 8px 0; }
+.notice-compose { display: grid; justify-items: start; gap: 8px; margin-top: 10px; }
+.notice-compose label { color: #aaa; font-size: 0.68rem; font-weight: 650; }
+.notice-compose textarea { min-height: 72px; }
+.notice-empty { margin: 0; padding: 8px 2px; color: #858585; font-size: 0.72rem; }
 
 @media (max-width: 700px) {
   .sidebar { border-bottom-color: #344f3b; }
@@ -1823,6 +2046,10 @@ td { border-top-color: #2d2d2d; color: #bbb; }
   .product-create-form,
   .markup-form,
   .role-management { grid-template-columns: 1fr; }
+  .notice-grid { grid-template-columns: 1fr; }
+  .notice-section-create { align-items: stretch; flex-direction: column; }
+  .notice-section-create input,
+  .notice-section-create .secondary-button { width: 100%; }
   .order-line-total { padding-bottom: 0; text-align: left; }
   .order-submit-row { align-items: flex-start; flex-direction: column; }
   .warehouse-create-form { grid-template-columns: 1fr; }

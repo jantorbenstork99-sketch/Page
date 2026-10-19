@@ -15,6 +15,7 @@ function appPermissions(): array
         'products_manage',
         'product_markup_manage',
         'orders_manage',
+        'notice_sections_manage',
     ];
 }
 
@@ -102,6 +103,27 @@ function appDatabase(): PDO
             migrateUsers($database, $columns);
         }
     }
+
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS notice_sections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+            is_fixed INTEGER NOT NULL DEFAULT 0 CHECK (is_fixed IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+    $database->exec("INSERT OR IGNORE INTO notice_sections (name, is_fixed) VALUES ('Wichtige Informationen', 1)");
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS notices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            section_id INTEGER NOT NULL REFERENCES notice_sections(id) ON DELETE CASCADE,
+            author_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            author_name TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
 
     $database->exec(
         'CREATE TABLE IF NOT EXISTS warehouse_entries (
