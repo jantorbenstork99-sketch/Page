@@ -728,7 +728,6 @@ onMounted(loadSession)
           @click="activeSection = section.id"
         >
           {{ section.label }}
-          <span v-if="section.id === 'inventory'" class="nav-count">4</span>
         </button>
       </nav>
 
@@ -1636,8 +1635,6 @@ onMounted(loadSession)
 
 .nav-item:hover { background: #f6f8f3; color: #354a3b; }
 .nav-item-active { background: #eff4e8; color: #334937; font-weight: 700; }
-.nav-count { display: grid; width: 21px; height: 21px; margin-left: auto; place-items: center; border-radius: 50%; background: #f1f2ed; color: #758077; font-size: 0.67rem; }
-
 .sidebar-bottom { margin-top: auto; }
 .help-card { display: grid; grid-template-columns: 28px 1fr; align-items: center; gap: 4px 9px; margin: 0 2px 15px; padding: 13px 11px; border: 1px solid #edf0ea; border-radius: 9px; }
 .help-icon { display: grid; width: 25px; height: 25px; grid-row: span 2; place-items: center; border-radius: 50%; background: #f1f4eb; color: #697a5d; font-size: 0.77rem; font-weight: 700; }
@@ -1734,7 +1731,6 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
   .workspace-label, .sidebar-bottom { display: none; }
   .side-nav { display: flex; gap: 5px; overflow-x: auto; }
   .nav-item { width: auto; height: 37px; flex: 0 0 auto; gap: 7px; padding: 0 9px; font-size: 0.73rem; }
-  .nav-count { width: 18px; height: 18px; }
   .topbar { height: 51px; padding: 0 18px; }
   .content { padding: 27px 17px; }
   .page-heading { align-items: flex-start; }
@@ -1772,7 +1768,6 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
 .nav-item { color: #e0e9e1; }
 .nav-item:hover { background: rgb(255 255 255 / 12%); color: #fff; }
 .nav-item-active { background: #dce9d8; color: #2f4b36; font-weight: 700; }
-.nav-count { background: rgb(255 255 255 / 18%); color: #f2f7f2; }
 .help-card { border-color: rgb(255 255 255 / 20%); }
 .help-icon { background: #dce9d8; color: #35533c; }
 .help-card strong { color: #f0f5f0; }
