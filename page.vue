@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 
 const currencyFormatter = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'EUR' })
+const cashCurrencyFormatter = new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'USD' })
 const percentFormatter = new Intl.NumberFormat('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 const sections = [
@@ -9,6 +10,8 @@ const sections = [
   { id: 'products', label: 'Produkte', mark: 'P', permissions: ['products_view', 'products_manage', 'product_markup_manage'] },
   { id: 'inventory', label: 'Lager', mark: 'L', permissions: ['inventory_view', 'inventory_manage', 'warehouses_manage'] },
   { id: 'orders', label: 'Bestellungen', mark: 'B', permissions: ['orders_manage'] },
+  { id: 'cash', label: 'Kasse', mark: 'K', permissions: ['cash_manage'] },
+  { id: 'balance', label: 'Kontostand', mark: '€', permissions: ['balance_view'] },
   { id: 'team', label: 'Mitglieder', mark: 'M', permissions: ['employees_view', 'employees_manage', 'employees_create'] },
   { id: 'roles', label: 'Rollen & Rechte', mark: 'R', permissions: ['roles_manage', 'members_order'] },
 ]
@@ -27,7 +30,15 @@ const permissionOptions = [
   { id: 'product_markup_manage', label: 'Produkt-Aufschlag einstellen' },
   { id: 'orders_manage', label: 'Bestellungen verwalten' },
   { id: 'notice_sections_manage', label: 'Nachrichtenbereiche verwalten und alle Nachrichten bearbeiten' },
+  { id: 'cash_manage', label: 'Kassenbuchungen ansehen, erfassen, bearbeiten und löschen' },
+  { id: 'balance_view', label: 'Kontostand und Buchungsverlauf ansehen' },
 ]
+
+function localDateString() {
+  const date = new Date()
+  const offset = date.getTimezoneOffset() * 60000
+  return new Date(date.getTime() - offset).toISOString().slice(0, 10)
+}
 
 const session = ref(null)
 const csrfToken = ref('')
@@ -47,6 +58,11 @@ const editingNoticeBodies = ref({})
 const newNoticeSectionName = ref('')
 const orderProducts = ref([])
 const savedOrders = ref([])
+const cashTransactions = ref([])
+const cashForm = ref({ date: localDateString(), name: '', purpose: '', amount: '', type: 'income' })
+const cashEditForm = ref(null)
+const balanceCents = ref(0)
+const balanceTransactions = ref([])
 const markupPercent = ref('20,00')
 const warehouseName = ref('')
 const productForm = ref({ name: '', purchasePrice: '' })
@@ -64,6 +80,7 @@ const savingWarehouse = ref(false)
 const savingProduct = ref(false)
 const savingNotice = ref(false)
 const savingNoticeSection = ref(false)
+const savingCash = ref(false)
 const savingMarkup = ref(false)
 const savingRoleOrder = ref(false)
 const error = ref('')
@@ -81,6 +98,8 @@ const canEditWarehouseEntries = computed(() => can('inventory_manage'))
 const canManageProducts = computed(() => can('products_manage'))
 const canManageProductMarkup = computed(() => can('product_markup_manage'))
 const canManageNoticeSections = computed(() => can('notice_sections_manage'))
+const canManageCash = computed(() => can('cash_manage'))
+const canViewBalance = computed(() => can('balance_view'))
 const assignableRoles = computed(() => roles.value.filter((role) => role.assignable))
 const availableSections = computed(() =>
   sections.filter((section) =>
@@ -90,6 +109,7 @@ const availableSections = computed(() =>
 const navigationGroups = computed(() => [
   { label: '', sections: availableSections.value.filter(({ id }) => ['overview', 'inventory'].includes(id)) },
   { label: 'Waffenbau', sections: availableSections.value.filter(({ id }) => ['products', 'orders'].includes(id)) },
+  { label: 'Finanzen', sections: availableSections.value.filter(({ id }) => ['cash', 'balance'].includes(id)) },
   { label: 'Verwaltung', sections: availableSections.value.filter(({ id }) => ['team', 'roles'].includes(id)) },
 ].filter(({ sections: groupSections }) => groupSections.length > 0))
 const currentSection = computed(() =>
@@ -113,6 +133,14 @@ function formatCurrency(value) {
 
 function formatCurrencyCents(value) {
   return formatCurrency((value / 100).toFixed(2))
+}
+
+function formatCashCurrency(value) {
+  return cashCurrencyFormatter.format(Number(value))
+}
+
+function formatCashCurrencyCents(value) {
+  return formatCashCurrency((value / 100).toFixed(2))
 }
 
 function formatPercent(value) {
@@ -213,6 +241,10 @@ async function logout() {
     warehouses.value = []
     orderProducts.value = []
     savedOrders.value = []
+    cashTransactions.value = []
+    cashEditForm.value = null
+    balanceCents.value = 0
+    balanceTransactions.value = []
   } catch (requestError) {
     error.value = requestError.message
   }
@@ -395,6 +427,76 @@ async function loadOrders() {
     const data = await request('/api/orders')
     orderProducts.value = data.products
     savedOrders.value = data.orders
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function loadCashTransactions() {
+  try {
+    const data = await request('/api/cash')
+    cashTransactions.value = data.transactions
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function createCashTransaction() {
+  error.value = ''
+  savingCash.value = true
+  try {
+    await request('/api/cash', {
+      method: 'POST',
+      body: JSON.stringify(cashForm.value),
+    })
+    cashForm.value = { date: localDateString(), name: '', purpose: '', amount: '', type: 'income' }
+    await loadCashTransactions()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingCash.value = false
+  }
+}
+
+function startEditingCashTransaction(transaction) {
+  cashEditForm.value = { ...transaction, amount: transaction.amount.replace('.', ',') }
+}
+
+async function saveCashTransaction() {
+  if (!cashEditForm.value) return
+  error.value = ''
+  savingCash.value = true
+  try {
+    await request(`/api/cash/${cashEditForm.value.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(cashEditForm.value),
+    })
+    cashEditForm.value = null
+    await loadCashTransactions()
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    savingCash.value = false
+  }
+}
+
+async function deleteCashTransaction(transaction) {
+  if (!await confirmDelete(`Kassenbuchung „${transaction.name}“ über ${formatCashCurrency(transaction.amount)} löschen?`)) return
+  error.value = ''
+  try {
+    await request(`/api/cash/${transaction.id}`, { method: 'DELETE' })
+    if (cashEditForm.value?.id === transaction.id) cashEditForm.value = null
+    await loadCashTransactions()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
+}
+
+async function loadBalance() {
+  try {
+    const data = await request('/api/balance')
+    balanceCents.value = data.balanceCents
+    balanceTransactions.value = data.transactions
   } catch (requestError) {
     error.value = requestError.message
   }
@@ -654,6 +756,8 @@ watch([activeSection, session], ([section, user]) => {
   if (section === 'inventory') loadWarehouses()
   if (section === 'products') loadProducts()
   if (section === 'orders') loadOrders()
+  if (section === 'cash') loadCashTransactions()
+  if (section === 'balance') loadBalance()
 })
 
 watch(roles, (items) => {
@@ -969,6 +1073,185 @@ onMounted(loadSession)
               </article>
             </div>
             <p v-else class="order-empty-products">Noch keine Bestellungen gespeichert.</p>
+          </section>
+        </template>
+
+        <template v-else-if="activeSection === 'cash' && canManageCash">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">KASSENVERWALTUNG</p>
+              <h1>Kasse</h1>
+              <p class="page-subtitle">Erfasse Einnahmen und Ausgaben. Summen und Kontostand sind hier nicht sichtbar.</p>
+            </div>
+          </div>
+
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Neue Buchung</h2>
+                <p>Datum, Name, Zweck, Betrag und Buchungsart eintragen.</p>
+              </div>
+            </div>
+            <form class="management-form cash-form" @submit.prevent="createCashTransaction">
+              <label>
+                Datum
+                <input v-model="cashForm.date" type="date" required />
+              </label>
+              <label>
+                Name
+                <input v-model.trim="cashForm.name" maxlength="160" required />
+              </label>
+              <label>
+                Zweck
+                <input v-model.trim="cashForm.purpose" maxlength="160" required />
+              </label>
+              <label>
+                Betrag in Euro
+                <input
+                  v-model="cashForm.amount"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  pattern="[0-9]{1,9}([.,][0-9]{1,2})?"
+                  placeholder="0,00"
+                  required
+                />
+              </label>
+              <label>
+                Buchungsart
+                <select v-model="cashForm.type" required>
+                  <option value="income">Einnahme</option>
+                  <option value="expense">Ausgabe</option>
+                </select>
+              </label>
+              <button class="management-button" type="submit" :disabled="savingCash">
+                {{ savingCash ? 'Wird gespeichert …' : 'Buchung speichern' }}
+              </button>
+            </form>
+          </section>
+
+          <section v-if="cashEditForm" class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Buchung bearbeiten</h2>
+                <p>Änderungen wirken sich auf den Kontostand aus.</p>
+              </div>
+            </div>
+            <form class="management-form cash-form" @submit.prevent="saveCashTransaction">
+              <label>
+                Datum
+                <input v-model="cashEditForm.date" type="date" required />
+              </label>
+              <label>
+                Name
+                <input v-model.trim="cashEditForm.name" maxlength="160" required />
+              </label>
+              <label>
+                Zweck
+                <input v-model.trim="cashEditForm.purpose" maxlength="160" required />
+              </label>
+              <label>
+                Betrag in Euro
+                <input
+                  v-model="cashEditForm.amount"
+                  type="text"
+                  inputmode="decimal"
+                  maxlength="12"
+                  pattern="[0-9]{1,9}([.,][0-9]{1,2})?"
+                  required
+                />
+              </label>
+              <label>
+                Buchungsart
+                <select v-model="cashEditForm.type" required>
+                  <option value="income">Einnahme</option>
+                  <option value="expense">Ausgabe</option>
+                </select>
+              </label>
+              <div class="form-actions">
+                <button class="management-button" type="submit" :disabled="savingCash">
+                  {{ savingCash ? 'Wird gespeichert …' : 'Änderungen speichern' }}
+                </button>
+                <button class="secondary-button" type="button" @click="cashEditForm = null">Abbrechen</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Einzelne Buchungen</h2>
+                <p>{{ cashTransactions.length }} {{ cashTransactions.length === 1 ? 'Buchung' : 'Buchungen' }} · keine Summenansicht</p>
+              </div>
+            </div>
+            <div class="cash-entry-list">
+              <article v-for="transaction in cashTransactions" :key="transaction.id" class="cash-entry">
+                <div class="cash-entry-details">
+                  <strong>{{ transaction.name }}</strong>
+                  <span>Zweck: {{ transaction.purpose || '—' }}</span>
+                  <span>{{ transaction.date }}</span>
+                </div>
+                <span class="cash-entry-type" :class="`cash-type-${transaction.type}`">
+                  {{ transaction.type === 'income' ? 'Einnahme' : 'Ausgabe' }}
+                </span>
+                <strong class="cash-entry-amount">{{ formatCashCurrency(transaction.amount) }}</strong>
+                <div class="cash-entry-actions">
+                  <button class="text-link" type="button" @click="startEditingCashTransaction(transaction)">Bearbeiten</button>
+                  <button class="text-link role-delete" type="button" @click="deleteCashTransaction(transaction)">Löschen</button>
+                </div>
+              </article>
+              <p v-if="cashTransactions.length === 0" class="cash-empty">Noch keine Kassenbuchungen vorhanden.</p>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activeSection === 'balance' && canViewBalance">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">FINANZÜBERSICHT</p>
+              <h1>Kontostand</h1>
+              <p class="page-subtitle">Aktueller Stand und vollständiger Verlauf aller Einnahmen und Ausgaben.</p>
+            </div>
+          </div>
+
+          <section class="balance-card" aria-label="Aktueller Kontostand">
+            <span>Aktueller Kontostand</span>
+            <strong>{{ formatCashCurrencyCents(balanceCents) }}</strong>
+          </section>
+
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Buchungsverlauf</h2>
+                <p>{{ balanceTransactions.length }} {{ balanceTransactions.length === 1 ? 'Buchung' : 'Buchungen' }}</p>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="management-table balance-table">
+                <thead>
+                  <tr><th>DATUM</th><th>NAME</th><th>ZWECK</th><th>ART</th><th>BETRAG</th><th>KONTOSTAND NACH BUCHUNG</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="transaction in balanceTransactions" :key="transaction.id">
+                    <td>{{ transaction.date }}</td>
+                    <td class="product-name">{{ transaction.name }}</td>
+                    <td>{{ transaction.purpose || '—' }}</td>
+                    <td>
+                      <span class="cash-entry-type" :class="`cash-type-${transaction.type}`">
+                        {{ transaction.type === 'income' ? 'Einnahme' : 'Ausgabe' }}
+                      </span>
+                    </td>
+                    <td :class="transaction.type === 'income' ? 'balance-income' : 'balance-expense'">
+                      {{ transaction.type === 'income' ? '+' : '−' }}{{ formatCashCurrency(transaction.amount) }}
+                    </td>
+                    <td class="product-selling-price">{{ formatCashCurrencyCents(transaction.balanceCents) }}</td>
+                  </tr>
+                  <tr v-if="balanceTransactions.length === 0">
+                    <td class="empty-result" colspan="6">Noch keine Kassenbuchungen vorhanden.</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </section>
         </template>
 
@@ -1973,6 +2256,25 @@ td { border-top-color: #2d2d2d; color: #bbb; }
 .role-delete { color: #e99b92; }
 .role-form { padding: 0; align-content: start; }
 .role-form h3 { margin: 0; color: #e5e5e5; font-size: 0.87rem; }
+.cash-form { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; }
+.cash-form > button { grid-column: 1 / -1; }
+.cash-entry-list { display: grid; gap: 8px; padding: 0 20px 20px; }
+.cash-entry { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; align-items: center; gap: 16px; padding: 12px; border: 1px solid #303030; border-radius: 8px; background: #101010; }
+.cash-entry-details { display: grid; min-width: 0; gap: 5px; }
+.cash-entry-details strong { overflow: hidden; color: #e5e5e5; font-size: 0.78rem; text-overflow: ellipsis; }
+.cash-entry-details span { color: #999; font-size: 0.68rem; }
+.cash-entry-type { width: fit-content; padding: 5px 8px; border-radius: 12px; font-size: 0.65rem; font-weight: 700; }
+.cash-type-income { background: #25351f; color: #b9d995; }
+.cash-type-expense { background: #3a2926; color: #e7a298; }
+.cash-entry-amount { color: #e2e2e2; font-size: 0.79rem; white-space: nowrap; }
+.cash-entry-actions { display: flex; gap: 10px; }
+.cash-empty { margin: 0; padding: 16px 0; color: #999; font-size: 0.78rem; }
+.balance-card { display: grid; gap: 9px; margin-bottom: 18px; padding: 24px; border: 1px solid #4c6040; border-radius: 10px; background: linear-gradient(135deg, #20291c, #151a13); }
+.balance-card > span { color: #bac8ad; font-size: 0.78rem; }
+.balance-card > strong { color: #e1f0cc; font-size: clamp(1.8rem, 4vw, 2.6rem); letter-spacing: -0.04em; }
+.balance-table { min-width: 720px; }
+.balance-income { color: #b9d995 !important; font-weight: 700; }
+.balance-expense { color: #e7a298 !important; font-weight: 700; }
 .permission-list { display: grid; gap: 10px; margin: 0; padding: 12px; border: 1px solid #303030; border-radius: 8px; }
 .permission-list legend { padding: 0 5px; color: #c8c8c8; font-size: 0.73rem; font-weight: 650; }
 .permission-list label { display: flex; align-items: flex-start; gap: 8px; color: #bcbcbc; font-size: 0.72rem; line-height: 1.4; }
@@ -2058,7 +2360,13 @@ td { border-top-color: #2d2d2d; color: #bbb; }
   .order-line,
   .product-create-form,
   .markup-form,
+  .cash-form,
   .role-management { grid-template-columns: 1fr; }
+  .cash-form > button { grid-column: auto; }
+  .cash-entry { grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+  .cash-entry-amount { justify-self: end; }
+  .cash-entry-actions { grid-column: 1 / -1; }
+  .balance-table { min-width: 680px; }
   .notice-grid { grid-template-columns: 1fr; }
   .notice-section-create { align-items: stretch; flex-direction: column; }
   .notice-section-create input,

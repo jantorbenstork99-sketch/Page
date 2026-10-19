@@ -183,7 +183,22 @@ function decimalToScaledInteger(mixed $value, int $maxWholeDigits, int $fraction
 function formatScaledInteger(int $value, int $fractionDigits): string
 {
     $factor = 10 ** $fractionDigits;
-    return intdiv($value, $factor) . '.' . str_pad((string) ($value % $factor), $fractionDigits, '0', STR_PAD_LEFT);
+    $absoluteValue = abs($value);
+    $sign = $value < 0 ? '-' : '';
+    return $sign . intdiv($absoluteValue, $factor) . '.' . str_pad((string) ($absoluteValue % $factor), $fractionDigits, '0', STR_PAD_LEFT);
+}
+
+function validTransactionDate(mixed $value): bool
+{
+    if (!is_string($value) || preg_match('/^\d{4}-\d{2}-\d{2}$/D', $value) !== 1) {
+        return false;
+    }
+
+    $date = DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+    $dateErrors = DateTimeImmutable::getLastErrors();
+    return $date !== false
+        && ($dateErrors === false || ($dateErrors['warning_count'] === 0 && $dateErrors['error_count'] === 0))
+        && $date->format('Y-m-d') === $value;
 }
 
 try {
@@ -242,6 +257,114 @@ try {
 
     $sessionUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
     $currentUser = $sessionUserId === false || $sessionUserId === null ? null : publicUser($database, $sessionUserId);
+
+    if ($path === '/api/cash' && $method === 'GET') {
+        requirePermission($currentUser, 'cash_manage');
+        $transactions = $database->query(
+            'SELECT id, transaction_date AS date, name, purpose, amount_cents AS amountCents, transaction_type AS type
+             FROM cash_transactions ORDER BY transaction_date DESC, id DESC'
+        )->fetchAll();
+        foreach ($transactions as &$transaction) {
+            $transaction['id'] = (int) $transaction['id'];
+            $transaction['amount'] = formatScaledInteger((int) $transaction['amountCents'], 2);
+            unset($transaction['amountCents']);
+        }
+        unset($transaction);
+        respond(['transactions' => $transactions]);
+    }
+
+    if ($path === '/api/cash' && $method === 'POST') {
+        requirePermission($currentUser, 'cash_manage');
+        verifyCsrfToken();
+        $body = requestBody();
+        $date = $body['date'] ?? null;
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        $purpose = is_string($body['purpose'] ?? null) ? trim($body['purpose']) : '';
+        $amountCents = decimalToScaledInteger($body['amount'] ?? null, 9, 2);
+        $type = $body['type'] ?? null;
+        if (!validTransactionDate($date) || $name === '' || strlen($name) > 160 || $purpose === '' || strlen($purpose) > 160 || $amountCents === null || $amountCents < 1 || !in_array($type, ['income', 'expense'], true)) {
+            respond(['error' => 'Bitte prüfe Datum, Name, Zweck, Betrag und Einnahme/Ausgabe. Der Betrag muss größer als 0 sein.'], 422);
+        }
+        $createTransaction = $database->prepare(
+            'INSERT INTO cash_transactions (transaction_date, name, purpose, amount_cents, transaction_type)
+             VALUES (:date, :name, :purpose, :amount, :type)'
+        );
+        $createTransaction->execute(['date' => $date, 'name' => $name, 'purpose' => $purpose, 'amount' => $amountCents, 'type' => $type]);
+        respond(['transaction' => ['id' => (int) $database->lastInsertId()], 'message' => 'Kassenbuchung wurde gespeichert.'], 201);
+    }
+
+    if (preg_match('#^/api/cash/(\d+)$#D', (string) $path, $cashMatch) === 1) {
+        requirePermission($currentUser, 'cash_manage');
+        $transactionId = (int) $cashMatch[1];
+        if ($method === 'PATCH') {
+            verifyCsrfToken();
+            $body = requestBody();
+            $date = $body['date'] ?? null;
+            $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+            $purpose = is_string($body['purpose'] ?? null) ? trim($body['purpose']) : '';
+            $amountCents = decimalToScaledInteger($body['amount'] ?? null, 9, 2);
+            $type = $body['type'] ?? null;
+            if (!validTransactionDate($date) || $name === '' || strlen($name) > 160 || $purpose === '' || strlen($purpose) > 160 || $amountCents === null || $amountCents < 1 || !in_array($type, ['income', 'expense'], true)) {
+                respond(['error' => 'Bitte prüfe Datum, Name, Zweck, Betrag und Einnahme/Ausgabe. Der Betrag muss größer als 0 sein.'], 422);
+            }
+            $updateTransaction = $database->prepare(
+                'UPDATE cash_transactions
+                 SET transaction_date = :date, name = :name, purpose = :purpose, amount_cents = :amount,
+                     transaction_type = :type, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = :id'
+            );
+            $updateTransaction->execute([
+                'date' => $date,
+                'name' => $name,
+                'purpose' => $purpose,
+                'amount' => $amountCents,
+                'type' => $type,
+                'id' => $transactionId,
+            ]);
+            if ($updateTransaction->rowCount() === 0) {
+                $exists = $database->prepare('SELECT 1 FROM cash_transactions WHERE id = :id');
+                $exists->execute(['id' => $transactionId]);
+                if ($exists->fetchColumn() === false) {
+                    respond(['error' => 'Kassenbuchung wurde nicht gefunden.'], 404);
+                }
+            }
+            respond(['message' => 'Kassenbuchung wurde aktualisiert.']);
+        }
+
+        if ($method === 'DELETE') {
+            verifyCsrfToken();
+            $deleteTransaction = $database->prepare('DELETE FROM cash_transactions WHERE id = :id');
+            $deleteTransaction->execute(['id' => $transactionId]);
+            if ($deleteTransaction->rowCount() === 0) {
+                respond(['error' => 'Kassenbuchung wurde nicht gefunden.'], 404);
+            }
+            respond(['message' => 'Kassenbuchung wurde gelöscht.']);
+        }
+    }
+
+    if ($path === '/api/balance' && $method === 'GET') {
+        requirePermission($currentUser, 'balance_view');
+        $transactionRows = $database->query(
+            'SELECT id, transaction_date AS date, name, purpose, amount_cents AS amountCents, transaction_type AS type
+             FROM cash_transactions ORDER BY transaction_date, id'
+        )->fetchAll();
+        $balanceCents = 0;
+        $transactions = [];
+        foreach ($transactionRows as $transaction) {
+            $amountCents = (int) $transaction['amountCents'];
+            $balanceCents += $transaction['type'] === 'income' ? $amountCents : -$amountCents;
+            $transactions[] = [
+                'id' => (int) $transaction['id'],
+                'date' => $transaction['date'],
+                'name' => $transaction['name'],
+                'purpose' => $transaction['purpose'],
+                'type' => $transaction['type'],
+                'amount' => formatScaledInteger($amountCents, 2),
+                'balanceCents' => $balanceCents,
+            ];
+        }
+        respond(['balanceCents' => $balanceCents, 'transactions' => $transactions]);
+    }
 
     if ($path === '/api/notices' && $method === 'GET') {
         requireLogin($currentUser);

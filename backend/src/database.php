@@ -17,6 +17,8 @@ function appPermissions(): array
         'product_markup_manage',
         'orders_manage',
         'notice_sections_manage',
+        'cash_manage',
+        'balance_view',
     ];
 }
 
@@ -202,6 +204,22 @@ function appDatabase(): PDO
             line_total_cents INTEGER NOT NULL CHECK (line_total_cents >= 0)
         )'
     );
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS cash_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            transaction_date TEXT NOT NULL,
+            name TEXT NOT NULL,
+            purpose TEXT NOT NULL DEFAULT \'\',
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            transaction_type TEXT NOT NULL CHECK (transaction_type IN (\'income\', \'expense\')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+    $cashTransactionColumns = $database->query('PRAGMA table_info(cash_transactions)')->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('purpose', $cashTransactionColumns, true)) {
+        $database->exec("ALTER TABLE cash_transactions ADD COLUMN purpose TEXT NOT NULL DEFAULT ''");
+    }
 
     if (file_exists($databasePath) && !chmod($databasePath, 0600)) {
         throw new RuntimeException('Could not secure the database file permissions.');
