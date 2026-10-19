@@ -790,7 +790,6 @@ onMounted(loadSession)
                 v-for="section in noticeSections"
                 :key="section.id"
                 class="notice-card"
-                :class="{ 'notice-card-important': section.isFixed }"
               >
                 <header class="notice-card-heading">
                   <template v-if="editingNoticeSectionId === section.id">
@@ -802,7 +801,7 @@ onMounted(loadSession)
                   </template>
                   <template v-else>
                     <h3>{{ section.name }}</h3>
-                    <div v-if="canManageNoticeSections && !section.isFixed" class="notice-section-actions">
+                    <div v-if="canManageNoticeSections" class="notice-section-actions">
                       <button class="text-link" type="button" @click="startRenamingNoticeSection(section)">Umbenennen</button>
                       <button class="text-link role-delete" type="button" @click="deleteNoticeSection(section)">Löschen</button>
                     </div>
@@ -2012,10 +2011,8 @@ td { border-top-color: #2d2d2d; color: #bbb; }
 .notice-entry textarea:focus { border-color: #a8c879; }
 .notice-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .notice-card { min-width: 0; padding: 15px; border: 1px solid #303030; border-radius: 9px; background: #141414; }
-.notice-card-important { border-color: #596c42; background: #191e16; }
 .notice-card-heading { display: flex; min-height: 30px; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
 .notice-card-heading h3 { margin: 0; color: #e7e7e7; font-size: 0.85rem; }
-.notice-card-important .notice-card-heading h3 { color: #d7e7bf; }
 .notice-section-actions,
 .notice-entry-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .notice-section-actions { justify-content: flex-end; }

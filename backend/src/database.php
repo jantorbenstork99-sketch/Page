@@ -117,7 +117,6 @@ function appDatabase(): PDO
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )'
     );
-    $database->exec("INSERT OR IGNORE INTO notice_sections (name, is_fixed) VALUES ('Wichtige Informationen', 1)");
     $database->exec(
         'CREATE TABLE IF NOT EXISTS notices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +128,7 @@ function appDatabase(): PDO
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )'
     );
+    $database->exec('DELETE FROM notice_sections WHERE is_fixed = 1');
 
     $database->exec(
         'CREATE TABLE IF NOT EXISTS warehouse_entries (

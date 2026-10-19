@@ -90,8 +90,7 @@ function publicUser(PDO $database, int $id): ?array
 
     return [
         'id' => (int) $user['id'],
-        'name' => $user['name'],
-        'username' => $user['username'],
+        'name' => strcasecmp($user['username'], 'admin') === 0 ? 'Testkonto' : $user['name'],
         'roleId' => $user['role_id'],
         'roleName' => $user['role_name'],
         'permissions' => $permissionsStatement->fetchAll(PDO::FETCH_COLUMN),
@@ -247,17 +246,23 @@ try {
     if ($path === '/api/notices' && $method === 'GET') {
         requireLogin($currentUser);
         $noticeSections = $database->query(
-            'SELECT id, name, is_fixed AS isFixed FROM notice_sections ORDER BY is_fixed DESC, id'
+            'SELECT id, name FROM notice_sections ORDER BY id'
         )->fetchAll();
         foreach ($noticeSections as &$noticeSection) {
             $noticeSection['id'] = (int) $noticeSection['id'];
-            $noticeSection['isFixed'] = (bool) $noticeSection['isFixed'];
         }
         unset($noticeSection);
         $notices = $database->query(
-            'SELECT id, section_id AS sectionId, author_id AS authorId, author_name AS authorName,
-                    body, created_at AS createdAt, updated_at AS updatedAt
-             FROM notices ORDER BY created_at DESC, id DESC'
+            "SELECT notices.id, notices.section_id AS sectionId,
+                    CASE WHEN users.username = 'admin' COLLATE NOCASE THEN NULL ELSE notices.author_id END AS authorId,
+                    CASE
+                        WHEN users.username = 'admin' COLLATE NOCASE OR notices.author_name = 'admin' COLLATE NOCASE
+                        THEN 'Team'
+                        ELSE notices.author_name
+                    END AS authorName,
+                    notices.body, notices.created_at AS createdAt, notices.updated_at AS updatedAt
+             FROM notices LEFT JOIN users ON users.id = notices.author_id
+             ORDER BY notices.created_at DESC, notices.id DESC"
         )->fetchAll();
         foreach ($notices as &$notice) {
             $notice['id'] = (int) $notice['id'];
@@ -346,20 +351,16 @@ try {
         }
         $createSection = $database->prepare('INSERT INTO notice_sections (name) VALUES (:name)');
         $createSection->execute(['name' => $name]);
-        respond(['section' => ['id' => (int) $database->lastInsertId(), 'name' => $name, 'isFixed' => false]], 201);
+        respond(['section' => ['id' => (int) $database->lastInsertId(), 'name' => $name]], 201);
     }
 
     if (preg_match('#^/api/notice-sections/(\d+)$#D', (string) $path, $noticeSectionMatch) === 1) {
         requirePermission($currentUser, 'notice_sections_manage');
         $noticeSectionId = (int) $noticeSectionMatch[1];
-        $sectionCheck = $database->prepare('SELECT is_fixed FROM notice_sections WHERE id = :id');
+        $sectionCheck = $database->prepare('SELECT 1 FROM notice_sections WHERE id = :id');
         $sectionCheck->execute(['id' => $noticeSectionId]);
-        $sectionIsFixed = $sectionCheck->fetchColumn();
-        if ($sectionIsFixed === false) {
+        if ($sectionCheck->fetchColumn() === false) {
             respond(['error' => 'Nachrichtenbereich wurde nicht gefunden.'], 404);
-        }
-        if ((int) $sectionIsFixed === 1) {
-            respond(['error' => 'Der Bereich „Wichtige Informationen“ kann nicht umbenannt oder gelöscht werden.'], 409);
         }
 
         if ($method === 'PATCH') {
@@ -680,8 +681,10 @@ try {
         requirePermission($currentUser, 'inventory_view', 'inventory_manage', 'warehouses_manage');
         $warehouseRows = $database->query('SELECT id, name, sort_order AS sortOrder FROM warehouses ORDER BY sort_order, name COLLATE NOCASE')->fetchAll();
         $entryRows = $database->query(
-            'SELECT warehouse_id, user_id, locker_number AS lockerNumber, pin, contents
-             FROM warehouse_entries'
+            "SELECT warehouse_entries.warehouse_id, warehouse_entries.user_id,
+                    warehouse_entries.locker_number AS lockerNumber, warehouse_entries.pin, warehouse_entries.contents
+             FROM warehouse_entries JOIN users ON users.id = warehouse_entries.user_id
+             WHERE users.username != 'admin' COLLATE NOCASE"
         )->fetchAll();
         $entriesByWarehouse = [];
         foreach ($entryRows as $entry) {
@@ -703,7 +706,7 @@ try {
             'SELECT users.id, users.name, users.username, users.role_id AS roleId,
                     roles.name AS roleName, roles.sort_order AS roleOrder
              FROM users JOIN roles ON roles.id = users.role_id
-             WHERE users.is_active = 1
+             WHERE users.is_active = 1 AND users.username != \'admin\' COLLATE NOCASE
              ORDER BY roles.sort_order, roles.name COLLATE NOCASE, users.name COLLATE NOCASE, users.id'
         )->fetchAll();
         foreach ($members as &$member) {
@@ -844,7 +847,9 @@ try {
             $employees = $database->query(
                 'SELECT users.id, users.name, users.username, users.role_id AS roleId,
                         roles.name AS roleName, users.is_active AS isActive, users.created_at AS createdAt
-                 FROM users JOIN roles ON roles.id = users.role_id ORDER BY users.name COLLATE NOCASE'
+                 FROM users JOIN roles ON roles.id = users.role_id
+                 WHERE users.username != \'admin\' COLLATE NOCASE
+                 ORDER BY users.name COLLATE NOCASE'
             )->fetchAll();
             foreach ($employees as &$employee) {
                 $employee['id'] = (int) $employee['id'];
