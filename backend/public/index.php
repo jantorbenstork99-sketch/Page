@@ -855,7 +855,7 @@ try {
         }
 
         if ($method === 'POST' && $employeeId === null) {
-            requirePermission($currentUser, 'employees_manage');
+            requirePermission($currentUser, 'employees_create', 'employees_manage');
             verifyCsrfToken();
             $body = requestBody();
             $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
@@ -962,7 +962,7 @@ try {
         $roleId = $roleMatch[1] ?? null;
 
         if ($method === 'GET' && $roleId === null) {
-            requirePermission($currentUser, 'roles_manage', 'employees_manage', 'members_order');
+            requirePermission($currentUser, 'roles_manage', 'employees_manage', 'employees_create', 'members_order');
             $canManageRolePermissions = $currentUser !== null && in_array('roles_manage', $currentUser['permissions'], true);
             $roles = $database->query('SELECT id, name, is_system AS isSystem, sort_order AS sortOrder FROM roles ORDER BY sort_order, name COLLATE NOCASE')->fetchAll();
             $permissions = $database->query('SELECT role_id, permission FROM role_permissions ORDER BY permission')->fetchAll();

@@ -5,6 +5,7 @@ function appPermissions(): array
 {
     return [
         'employees_view',
+        'employees_create',
         'employees_manage',
         'roles_manage',
         'members_order',
@@ -69,6 +70,10 @@ function appDatabase(): PDO
     foreach (appPermissions() as $permission) {
         $insertPermission->execute(['role_id' => 'admin', 'permission' => $permission]);
     }
+    $database->exec(
+        "INSERT OR IGNORE INTO role_permissions (role_id, permission)
+         SELECT role_id, 'employees_create' FROM role_permissions WHERE permission = 'employees_manage'"
+    );
     $employeePermissionCount = (int) $database->query("SELECT COUNT(*) FROM role_permissions WHERE role_id = 'employee'")->fetchColumn();
     if ($employeePermissionCount === 0) {
         foreach (['employees_view', 'inventory_view'] as $permission) {

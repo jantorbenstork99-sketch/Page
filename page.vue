@@ -9,13 +9,14 @@ const sections = [
   { id: 'products', label: 'Produkte', mark: 'P', permissions: ['products_view', 'products_manage', 'product_markup_manage'] },
   { id: 'inventory', label: 'Lager', mark: 'L', permissions: ['inventory_view', 'inventory_manage', 'warehouses_manage'] },
   { id: 'orders', label: 'Bestellungen', mark: 'B', permissions: ['orders_manage'] },
-  { id: 'team', label: 'Mitglieder', mark: 'M', permissions: ['employees_view', 'employees_manage'] },
+  { id: 'team', label: 'Mitglieder', mark: 'M', permissions: ['employees_view', 'employees_manage', 'employees_create'] },
   { id: 'roles', label: 'Rollen & Rechte', mark: 'R', permissions: ['roles_manage', 'members_order'] },
 ]
 
 const permissionOptions = [
   { id: 'employees_view', label: 'Mitglieder ansehen' },
-  { id: 'employees_manage', label: 'Mitglieder anlegen, bearbeiten und deaktivieren' },
+  { id: 'employees_create', label: 'Mitglieder hinzufügen' },
+  { id: 'employees_manage', label: 'Mitglieder bearbeiten und deaktivieren' },
   { id: 'roles_manage', label: 'Rollen und Berechtigungen verwalten' },
   { id: 'members_order', label: 'Rangfolge der Rollen ändern' },
   { id: 'inventory_view', label: 'Lager ansehen' },
@@ -72,6 +73,7 @@ const userPermissions = computed(() => session.value?.permissions ?? [])
 const can = (permission) => userPermissions.value.includes(permission)
 const canViewEmployees = computed(() => can('employees_view') || can('employees_manage'))
 const canManageEmployees = computed(() => can('employees_manage'))
+const canAddEmployees = computed(() => can('employees_create') || canManageEmployees.value)
 const canManageRoles = computed(() => can('roles_manage'))
 const canManageRoleOrdering = computed(() => can('members_order'))
 const canManageWarehouses = computed(() => can('warehouses_manage'))
@@ -217,7 +219,7 @@ async function loadTeam() {
       const data = await request('/api/employees')
       employees.value = data.employees
     }
-    if (canManageEmployees.value || canManageRoles.value || canManageRoleOrdering.value) {
+    if (canAddEmployees.value || canManageEmployees.value || canManageRoles.value || canManageRoleOrdering.value) {
       const data = await request('/api/roles')
       roles.value = data.roles
     }
@@ -1222,7 +1224,7 @@ onMounted(loadSession)
             </div>
           </div>
 
-          <section v-if="canManageEmployees" class="panel-card management-card">
+          <section v-if="canAddEmployees" class="panel-card management-card">
             <div class="panel-heading">
               <div>
                 <h2>Mitglied hinzufügen</h2>
