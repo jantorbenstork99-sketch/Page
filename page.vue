@@ -87,6 +87,11 @@ const availableSections = computed(() =>
     section.id === 'overview' || section.permissions.some((permission) => can(permission)),
   ),
 )
+const navigationGroups = computed(() => [
+  { label: '', sections: availableSections.value.filter(({ id }) => ['overview', 'inventory'].includes(id)) },
+  { label: 'Waffenbau', sections: availableSections.value.filter(({ id }) => ['products', 'orders'].includes(id)) },
+  { label: 'Verwaltung', sections: availableSections.value.filter(({ id }) => ['team', 'roles'].includes(id)) },
+].filter(({ sections: groupSections }) => groupSections.length > 0))
 const currentSection = computed(() =>
   availableSections.value.find(({ id }) => id === activeSection.value) ?? availableSections.value[0],
 )
@@ -718,19 +723,21 @@ onMounted(loadSession)
     <aside class="sidebar">
       <a class="sidebar-brand wordmark" href="/" aria-label="ECHO Übersicht">ECHO</a>
 
-      <div class="workspace-label">ARBEITSBEREICH</div>
       <nav class="side-nav" aria-label="Hauptnavigation">
-        <button
-          v-for="section in availableSections"
-          :key="section.id"
-          class="nav-item"
-          :class="{ 'nav-item-active': activeSection === section.id }"
-          type="button"
-          :aria-current="activeSection === section.id ? 'page' : undefined"
-          @click="activeSection = section.id"
-        >
-          {{ section.label }}
-        </button>
+        <div v-for="group in navigationGroups" :key="group.label || 'main'" class="nav-group">
+          <h2 v-if="group.label" class="nav-group-label">{{ group.label }}</h2>
+          <button
+            v-for="section in group.sections"
+            :key="section.id"
+            class="nav-item"
+            :class="{ 'nav-item-active': activeSection === section.id }"
+            type="button"
+            :aria-current="activeSection === section.id ? 'page' : undefined"
+            @click="activeSection = section.id"
+          >
+            {{ section.label }}
+          </button>
+        </div>
       </nav>
 
       <div class="sidebar-bottom">
@@ -1613,8 +1620,18 @@ onMounted(loadSession)
 }
 
 .sidebar-brand { margin: 0 0 52px 6px; font-size: 1.65rem; }
-.workspace-label { margin: 0 0 12px 12px; color: #a2aaa4; font-size: 0.62rem; font-weight: 800; letter-spacing: 0.12em; }
-.side-nav { display: grid; gap: 5px; }
+.side-nav { display: grid; gap: 18px; }
+.nav-group { display: grid; gap: 5px; }
+.nav-group + .nav-group { padding-top: 13px; border-top: 1px solid rgb(255 255 255 / 20%); }
+.nav-group-label {
+  margin: 0 0 5px;
+  padding: 0 11px;
+  color: #fff;
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
 
 .nav-item {
   display: flex;
@@ -1729,8 +1746,11 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
   .workspace { display: block; }
   .sidebar { position: static; width: 100%; height: auto; padding: 13px 15px 10px; border-right: 0; border-bottom: 1px solid #e9ede8; }
   .sidebar-brand { margin: 0 0 13px 2px; }
-  .workspace-label, .sidebar-bottom { display: none; }
-  .side-nav { display: flex; gap: 5px; overflow-x: auto; }
+  .sidebar-bottom { display: none; }
+  .side-nav { display: flex; align-items: stretch; gap: 10px; overflow-x: auto; }
+  .nav-group { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+  .nav-group + .nav-group { padding-top: 0; padding-left: 10px; border-top: 0; border-left: 1px solid rgb(255 255 255 / 28%); }
+  .nav-group-label { margin: 0 3px 0 0; padding: 0; font-size: 0.58rem; letter-spacing: 0.06em; }
   .nav-item { width: auto; height: 37px; flex: 0 0 auto; gap: 7px; padding: 0 9px; font-size: 0.73rem; }
   .topbar { height: 51px; padding: 0 18px; }
   .content { padding: 27px 17px; }
@@ -1765,7 +1785,6 @@ td { height: 62px; padding: 8px 17px; border-top: 1px solid #f0f2ee; color: #7d8
   background: #304b37;
 }
 
-.workspace-label { color: #c4d3c6; }
 .nav-item { color: #e0e9e1; }
 .nav-item:hover { background: rgb(255 255 255 / 12%); color: #fff; }
 .nav-item-active { background: #dce9d8; color: #2f4b36; font-weight: 700; }
