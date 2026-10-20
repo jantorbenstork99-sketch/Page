@@ -1,0 +1,24 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Page (Frontend + Backend)",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"dev:backend",
+				"&",
+				"npm",
+				"run",
+				"dev",
+				"--",
+				"--host",
+				"0.0.0.0"
+			],
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

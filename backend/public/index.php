@@ -201,6 +201,21 @@ function validTransactionDate(mixed $value): bool
         && $date->format('Y-m-d') === $value;
 }
 
+function writeAuditLog(PDO $database, array $actor, string $action, string $resource, int|string|null $resourceId = null): void
+{
+    $statement = $database->prepare(
+        'INSERT INTO audit_logs (actor_id, actor_name, action, resource, resource_id)
+         VALUES (:actor_id, :actor_name, :action, :resource, :resource_id)'
+    );
+    $statement->execute([
+        'actor_id' => $actor['id'],
+        'actor_name' => $actor['name'],
+        'action' => $action,
+        'resource' => $resource,
+        'resource_id' => $resourceId === null ? null : (string) $resourceId,
+    ]);
+}
+
 try {
     $database = appDatabase();
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
@@ -240,11 +255,28 @@ try {
 
         $_SESSION['user_id'] = (int) $userRecord['id'];
         $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
-        respond(['user' => publicUser($database, (int) $userRecord['id']), 'csrfToken' => csrfToken()]);
+        $loggedInUser = publicUser($database, (int) $userRecord['id']);
+        if ($loggedInUser === null) {
+            throw new RuntimeException('Authenticated account could not be loaded.');
+        }
+        writeAuditLog($database, $loggedInUser, 'Angemeldet', 'Konto');
+        respond(['user' => $loggedInUser, 'csrfToken' => csrfToken()]);
     }
 
     if ($path === '/api/logout' && $method === 'POST') {
         verifyCsrfToken();
+        $logoutUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
+        if ($logoutUserId !== false && $logoutUserId !== null) {
+            $logoutUserStatement = $database->prepare('SELECT id, name, username FROM users WHERE id = :id');
+            $logoutUserStatement->execute(['id' => $logoutUserId]);
+            $logoutUser = $logoutUserStatement->fetch();
+            if ($logoutUser !== false) {
+                writeAuditLog($database, [
+                    'id' => (int) $logoutUser['id'],
+                    'name' => strcasecmp($logoutUser['username'], 'admin') === 0 ? 'Testkonto' : $logoutUser['name'],
+                ], 'Abgemeldet', 'Konto');
+            }
+        }
         $_SESSION = [];
 
         if (!session_regenerate_id(true)) {
@@ -257,6 +289,56 @@ try {
 
     $sessionUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
     $currentUser = $sessionUserId === false || $sessionUserId === null ? null : publicUser($database, $sessionUserId);
+
+    if ($path === '/api/logs' && $method === 'GET') {
+        requirePermission($currentUser, 'logs_view');
+        $beforeId = null;
+        if (isset($_GET['before'])) {
+            $beforeId = filter_var($_GET['before'], FILTER_VALIDATE_INT);
+            if ($beforeId === false || $beforeId === null || $beforeId < 1) {
+                respond(['error' => 'Ungültiger Protokoll-Cursor.'], 422);
+            }
+        }
+        $query = 'SELECT id, actor_name AS actorName, action, resource, resource_id AS resourceId, created_at AS createdAt
+                  FROM audit_logs';
+        if ($beforeId !== null) {
+            $query .= ' WHERE id < :before_id';
+        }
+        $query .= ' ORDER BY id DESC LIMIT 101';
+        $getLogs = $database->prepare($query);
+        $getLogs->execute($beforeId === null ? [] : ['before_id' => $beforeId]);
+        $logs = $getLogs->fetchAll();
+        $hasMore = count($logs) > 100;
+        if ($hasMore) {
+            array_pop($logs);
+        }
+        foreach ($logs as &$log) {
+            $log['id'] = (int) $log['id'];
+        }
+        unset($log);
+        respond([
+            'logs' => $logs,
+            'hasMore' => $hasMore,
+            'nextBefore' => $logs === [] ? null : $logs[array_key_last($logs)]['id'],
+        ]);
+    }
+
+    if ($path === '/api/logs' && $method === 'DELETE') {
+        requirePermission($currentUser, 'logs_delete');
+        verifyCsrfToken();
+        $database->beginTransaction();
+        try {
+            $database->exec('DELETE FROM audit_logs');
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Protokoll');
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+        respond(['message' => 'Das Protokoll wurde gelöscht.']);
+    }
 
     if ($path === '/api/cash' && $method === 'GET') {
         requirePermission($currentUser, 'cash_manage');
@@ -290,7 +372,9 @@ try {
              VALUES (:date, :name, :purpose, :amount, :type)'
         );
         $createTransaction->execute(['date' => $date, 'name' => $name, 'purpose' => $purpose, 'amount' => $amountCents, 'type' => $type]);
-        respond(['transaction' => ['id' => (int) $database->lastInsertId()], 'message' => 'Kassenbuchung wurde gespeichert.'], 201);
+        $transactionId = (int) $database->lastInsertId();
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Kassenbuchung', $transactionId);
+        respond(['transaction' => ['id' => $transactionId], 'message' => 'Kassenbuchung wurde gespeichert.'], 201);
     }
 
     if (preg_match('#^/api/cash/(\d+)$#D', (string) $path, $cashMatch) === 1) {
@@ -328,6 +412,7 @@ try {
                     respond(['error' => 'Kassenbuchung wurde nicht gefunden.'], 404);
                 }
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Kassenbuchung', $transactionId);
             respond(['message' => 'Kassenbuchung wurde aktualisiert.']);
         }
 
@@ -338,6 +423,7 @@ try {
             if ($deleteTransaction->rowCount() === 0) {
                 respond(['error' => 'Kassenbuchung wurde nicht gefunden.'], 404);
             }
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Kassenbuchung', $transactionId);
             respond(['message' => 'Kassenbuchung wurde gelöscht.']);
         }
     }
@@ -420,7 +506,9 @@ try {
             'author_name' => $user['name'],
             'body' => trim($noticeText),
         ]);
-        respond(['notice' => ['id' => (int) $database->lastInsertId()], 'message' => 'Nachricht wurde veröffentlicht.'], 201);
+        $noticeId = (int) $database->lastInsertId();
+        writeAuditLog($database, $user, 'Erstellt', 'Nachricht', $noticeId);
+        respond(['notice' => ['id' => $noticeId], 'message' => 'Nachricht wurde veröffentlicht.'], 201);
     }
 
     if (preg_match('#^/api/notices/(\d+)$#D', (string) $path, $noticeMatch) === 1) {
@@ -448,6 +536,7 @@ try {
                 'UPDATE notices SET body = :body, updated_at = CURRENT_TIMESTAMP WHERE id = :id'
             );
             $updateNotice->execute(['body' => trim($noticeText), 'id' => $noticeId]);
+            writeAuditLog($database, $user, 'Bearbeitet', 'Nachricht', $noticeId);
             respond(['message' => 'Nachricht wurde gespeichert.']);
         }
 
@@ -455,6 +544,7 @@ try {
             verifyCsrfToken();
             $deleteNotice = $database->prepare('DELETE FROM notices WHERE id = :id');
             $deleteNotice->execute(['id' => $noticeId]);
+            writeAuditLog($database, $user, 'Gelöscht', 'Nachricht', $noticeId);
             respond(['message' => 'Nachricht wurde gelöscht.']);
         }
     }
@@ -474,7 +564,9 @@ try {
         }
         $createSection = $database->prepare('INSERT INTO notice_sections (name) VALUES (:name)');
         $createSection->execute(['name' => $name]);
-        respond(['section' => ['id' => (int) $database->lastInsertId(), 'name' => $name]], 201);
+        $sectionId = (int) $database->lastInsertId();
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Nachrichtenbereich', $sectionId);
+        respond(['section' => ['id' => $sectionId, 'name' => $name]], 201);
     }
 
     if (preg_match('#^/api/notice-sections/(\d+)$#D', (string) $path, $noticeSectionMatch) === 1) {
@@ -502,6 +594,7 @@ try {
             }
             $renameSection = $database->prepare('UPDATE notice_sections SET name = :name WHERE id = :id');
             $renameSection->execute(['name' => $name, 'id' => $noticeSectionId]);
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Nachrichtenbereich', $noticeSectionId);
             respond(['message' => 'Bereich wurde umbenannt.']);
         }
 
@@ -514,6 +607,7 @@ try {
             }
             $deleteSection = $database->prepare('DELETE FROM notice_sections WHERE id = :id');
             $deleteSection->execute(['id' => $noticeSectionId]);
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Nachrichtenbereich', $noticeSectionId);
             respond(['message' => 'Bereich wurde gelöscht.']);
         }
     }
@@ -593,9 +687,11 @@ try {
         }
         $createMaterial = $database->prepare('INSERT INTO raw_materials (name, unit) VALUES (:name, :unit)');
         $createMaterial->execute(['name' => $name, 'unit' => 'Stück']);
+        $materialId = (int) $database->lastInsertId();
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Rohstoff', $materialId);
         respond([
             'material' => [
-                'id' => (int) $database->lastInsertId(),
+                'id' => $materialId,
                 'name' => $name,
             ],
             'message' => 'Rohstoff wurde angelegt.',
@@ -632,6 +728,7 @@ try {
                     respond(['error' => 'Rohstoff wurde nicht gefunden.'], 404);
                 }
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Rohstoff', $materialId);
             respond(['message' => 'Rohstoff wurde aktualisiert.']);
         }
 
@@ -649,6 +746,7 @@ try {
             }
             $deleteMaterial = $database->prepare('DELETE FROM raw_materials WHERE id = :id');
             $deleteMaterial->execute(['id' => $materialId]);
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Rohstoff', $materialId);
             respond(['message' => 'Rohstoff wurde gelöscht.']);
         }
     }
@@ -720,6 +818,7 @@ try {
             }
             throw $recipeError;
         }
+        writeAuditLog($database, $currentUser, 'Bearbeitet', 'Produktrezeptur', $productId);
         respond(['message' => 'Produktrezeptur wurde gespeichert.']);
     }
 
@@ -735,6 +834,7 @@ try {
             'UPDATE product_settings SET markup_basis_points = :markup_basis_points, updated_at = CURRENT_TIMESTAMP WHERE id = 1'
         );
         $updateMarkup->execute(['markup_basis_points' => $markupBasisPoints]);
+        writeAuditLog($database, $currentUser, 'Bearbeitet', 'Standardaufschlag');
         respond(['message' => 'Produktaufschlag wurde gespeichert.']);
     }
 
@@ -760,6 +860,7 @@ try {
                 respond(['error' => 'Produkt wurde nicht gefunden.'], 404);
             }
         }
+        writeAuditLog($database, $currentUser, 'Bearbeitet', 'Produktaufschlag', (int) $productMarkupMatch[1]);
         respond(['message' => 'Produktaufschlag wurde gespeichert.']);
     }
 
@@ -784,7 +885,9 @@ try {
             'purchase_price_cents' => $purchasePriceCents,
             'markup_basis_points' => $defaultMarkupBasisPoints,
         ]);
-        respond(['product' => ['id' => (int) $database->lastInsertId()], 'message' => 'Produkt wurde angelegt.'], 201);
+        $productId = (int) $database->lastInsertId();
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Produkt', $productId);
+        respond(['product' => ['id' => $productId], 'message' => 'Produkt wurde angelegt.'], 201);
     }
 
     if (preg_match('#^/api/products/(\d+)$#D', (string) $path, $productMatch) === 1) {
@@ -815,6 +918,7 @@ try {
                     respond(['error' => 'Produkt wurde nicht gefunden.'], 404);
                 }
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Produkt', $productId);
             respond(['message' => 'Produkt wurde gespeichert.']);
         }
 
@@ -826,6 +930,7 @@ try {
             if ($deleteProduct->rowCount() === 0) {
                 respond(['error' => 'Produkt wurde nicht gefunden.'], 404);
             }
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Produkt', $productId);
             respond(['message' => 'Produkt wurde gelöscht.']);
         }
     }
@@ -970,6 +1075,7 @@ try {
             }
             throw $error;
         }
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Bestellung', $orderId);
         respond([
             'order' => ['id' => $orderId, 'total' => formatScaledInteger($totalCents, 2)],
             'message' => 'Bestellung wurde gespeichert.',
@@ -1029,7 +1135,9 @@ try {
         $sortOrder = (int) $database->query('SELECT COALESCE(MAX(sort_order), 0) + 100 FROM warehouses')->fetchColumn();
         $createWarehouse = $database->prepare('INSERT INTO warehouses (name, sort_order) VALUES (:name, :sort_order)');
         $createWarehouse->execute(['name' => $name, 'sort_order' => $sortOrder]);
-        respond(['warehouse' => ['id' => (int) $database->lastInsertId(), 'name' => $name, 'sortOrder' => $sortOrder]], 201);
+        $warehouseId = (int) $database->lastInsertId();
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Lager', $warehouseId);
+        respond(['warehouse' => ['id' => $warehouseId, 'name' => $name, 'sortOrder' => $sortOrder]], 201);
     }
 
     if (preg_match('#^/api/warehouses/(\d+)$#D', (string) $path, $warehouseMatch) === 1) {
@@ -1052,6 +1160,7 @@ try {
                     respond(['error' => 'Lager wurde nicht gefunden.'], 404);
                 }
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Lager', $warehouseId);
             respond(['message' => 'Lagername wurde gespeichert.']);
         }
 
@@ -1063,6 +1172,7 @@ try {
             if ($deleteWarehouse->rowCount() === 0) {
                 respond(['error' => 'Lager wurde nicht gefunden.'], 404);
             }
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Lager', $warehouseId);
             respond(['message' => 'Lager und zugehörige Einträge wurden gelöscht.']);
         }
     }
@@ -1101,6 +1211,13 @@ try {
         if ($saveEntry->rowCount() === 0) {
             respond(['error' => 'Lager oder aktives Mitglied wurde nicht gefunden.'], 404);
         }
+        writeAuditLog(
+            $database,
+            $currentUser,
+            'Bearbeitet',
+            'Lagereintrag',
+            $entryMatch[1] . ':' . $entryMatch[2]
+        );
         respond(['message' => 'Lagereintrag wurde gespeichert.']);
     }
 
@@ -1135,6 +1252,7 @@ try {
             }
             throw $error;
         }
+        writeAuditLog($database, $currentUser, 'Bearbeitet', 'Rollenrangfolge');
         respond(['message' => 'Rangfolge wurde gespeichert.']);
     }
 
@@ -1189,7 +1307,9 @@ try {
                 'password_hash' => password_hash($password, PASSWORD_DEFAULT),
                 'role_id' => $roleId,
             ]);
-            respond(['employee' => ['id' => (int) $database->lastInsertId()], 'message' => 'Mitgliedskonto wurde angelegt.'], 201);
+            $createdEmployeeId = (int) $database->lastInsertId();
+            writeAuditLog($database, $currentUser, 'Erstellt', 'Mitgliedskonto', $createdEmployeeId);
+            respond(['employee' => ['id' => $createdEmployeeId], 'message' => 'Mitgliedskonto wurde angelegt.'], 201);
         }
 
         if ($method === 'PATCH' && $employeeId !== null) {
@@ -1258,6 +1378,7 @@ try {
                     respond(['error' => 'Mitglied wurde nicht gefunden.'], 404);
                 }
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Mitgliedskonto', $employeeId);
             respond(['message' => 'Mitgliedskonto wurde aktualisiert.']);
         }
     }
@@ -1313,6 +1434,7 @@ try {
                 }
                 throw $error;
             }
+            writeAuditLog($database, $currentUser, 'Erstellt', 'Rolle', $newRoleId);
             respond(['role' => ['id' => $newRoleId, 'name' => $name, 'permissions' => $permissions]], 201);
         }
 
@@ -1371,6 +1493,7 @@ try {
                 }
                 throw $error;
             }
+            writeAuditLog($database, $currentUser, 'Bearbeitet', 'Rolle', $roleId);
             respond(['message' => 'Rolle wurde aktualisiert.']);
         }
 
@@ -1395,6 +1518,7 @@ try {
 
             $deleteRole = $database->prepare('DELETE FROM roles WHERE id = :id');
             $deleteRole->execute(['id' => $roleId]);
+            writeAuditLog($database, $currentUser, 'Gelöscht', 'Rolle', $roleId);
             respond(['message' => 'Rolle wurde gelöscht.']);
         }
     }

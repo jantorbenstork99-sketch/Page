@@ -17,6 +17,8 @@ function appPermissions(): array
         'product_markup_manage',
         'orders_manage',
         'notice_sections_manage',
+        'logs_view',
+        'logs_delete',
         'cash_manage',
         'balance_view',
     ];
@@ -275,6 +277,17 @@ function appDatabase(): PDO
             quantity INTEGER NOT NULL CHECK (quantity BETWEEN 1 AND 9999),
             unit_price_cents INTEGER NOT NULL CHECK (unit_price_cents >= 0),
             line_total_cents INTEGER NOT NULL CHECK (line_total_cents >= 0)
+        )'
+    );
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_id INTEGER,
+            actor_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            resource TEXT NOT NULL,
+            resource_id TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )'
     );
     $database->exec(

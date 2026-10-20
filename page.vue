@@ -14,6 +14,7 @@ const sections = [
   { id: 'orders', label: 'Bestellungen', mark: 'B', permissions: ['orders_manage'] },
   { id: 'cash', label: 'Kasse', mark: 'K', permissions: ['cash_manage'] },
   { id: 'balance', label: 'Kontostand', mark: '€', permissions: ['balance_view'] },
+  { id: 'logs', label: 'Protokolle', mark: 'P', permissions: ['logs_view'] },
   { id: 'team', label: 'Mitglieder', mark: 'M', permissions: ['employees_view', 'employees_manage', 'employees_create'] },
   { id: 'roles', label: 'Rollen & Rechte', mark: 'R', permissions: ['roles_manage', 'members_order'] },
 ]
@@ -32,6 +33,8 @@ const permissionOptions = [
   { id: 'product_markup_manage', label: 'Produkt-Aufschlag einstellen' },
   { id: 'orders_manage', label: 'Bestellungen verwalten' },
   { id: 'notice_sections_manage', label: 'Nachrichtenbereiche verwalten und alle Nachrichten bearbeiten' },
+  { id: 'logs_view', label: 'Aktivitätsprotokoll ansehen' },
+  { id: 'logs_delete', label: 'Aktivitätsprotokoll löschen' },
   { id: 'cash_manage', label: 'Kassenbuchungen ansehen, erfassen, bearbeiten und löschen' },
   { id: 'balance_view', label: 'Kontostand und Buchungsverlauf ansehen' },
 ]
@@ -67,6 +70,10 @@ const cashForm = ref({ date: localDateString(), name: '', purpose: '', amount: '
 const cashEditForm = ref(null)
 const balanceCents = ref(0)
 const balanceTransactions = ref([])
+const auditLogs = ref([])
+const auditLogsHasMore = ref(false)
+const auditLogsNextBefore = ref(null)
+const loadingAuditLogs = ref(false)
 const markupPercent = ref('20,00')
 const warehouseName = ref('')
 const productForm = ref({ name: '', purchasePrice: '' })
@@ -119,6 +126,7 @@ const navigationGroups = computed(() => [
   { label: 'Waffenbau', sections: availableSections.value.filter(({ id }) => ['products', 'materials', 'production', 'orders'].includes(id)) },
   { label: 'Finanzen', sections: availableSections.value.filter(({ id }) => ['cash', 'balance'].includes(id)) },
   { label: 'Verwaltung', sections: availableSections.value.filter(({ id }) => ['team', 'roles'].includes(id)) },
+  { label: 'System', sections: availableSections.value.filter(({ id }) => ['logs'].includes(id)) },
 ].filter(({ sections: groupSections }) => groupSections.length > 0))
 const currentSection = computed(() =>
   availableSections.value.find(({ id }) => id === activeSection.value) ?? availableSections.value[0],
@@ -170,6 +178,41 @@ function formatPercent(value) {
 
 function formatRecipeQuantity(value) {
   return new Intl.NumberFormat('de-DE', { maximumFractionDigits: 3 }).format(value)
+}
+
+function formatAuditTimestamp(value) {
+  return new Intl.DateTimeFormat('de-DE', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(`${value.replace(' ', 'T')}Z`))
+}
+
+async function loadAuditLogs(loadMore = false) {
+  error.value = ''
+  loadingAuditLogs.value = true
+  try {
+    const cursor = loadMore ? auditLogsNextBefore.value : null
+    const query = cursor ? `?before=${encodeURIComponent(cursor)}` : ''
+    const data = await request(`/api/logs${query}`)
+    auditLogs.value = loadMore ? [...auditLogs.value, ...data.logs] : data.logs
+    auditLogsHasMore.value = data.hasMore
+    auditLogsNextBefore.value = data.nextBefore
+  } catch (requestError) {
+    error.value = requestError.message
+  } finally {
+    loadingAuditLogs.value = false
+  }
+}
+
+async function clearAuditLogs() {
+  if (!await confirmDelete('Alle bisherigen Protokolleinträge löschen? Dieser Schritt kann nicht rückgängig gemacht werden.')) return
+  error.value = ''
+  try {
+    await request('/api/logs', { method: 'DELETE' })
+    await loadAuditLogs()
+  } catch (requestError) {
+    error.value = requestError.message
+  }
 }
 
 function defaultEmployeeRoleId() {
@@ -282,6 +325,9 @@ async function logout() {
     cashEditForm.value = null
     balanceCents.value = 0
     balanceTransactions.value = []
+    auditLogs.value = []
+    auditLogsHasMore.value = false
+    auditLogsNextBefore.value = null
   } catch (requestError) {
     error.value = requestError.message
   }
@@ -893,6 +939,7 @@ watch([activeSection, session], ([section, user]) => {
   if (section === 'orders') loadOrders()
   if (section === 'cash') loadCashTransactions()
   if (section === 'balance') loadBalance()
+  if (section === 'logs') loadAuditLogs()
 })
 
 watch(roles, (items) => {
@@ -1400,6 +1447,64 @@ onMounted(loadSession)
                 </tbody>
               </table>
             </div>
+          </section>
+        </template>
+
+        <template v-else-if="activeSection === 'logs' && can('logs_view')">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">SYSTEMAKTIVITÄTEN</p>
+              <h1>Protokolle</h1>
+              <p class="page-subtitle">Anmeldungen und erfolgreiche Änderungen im Arbeitsbereich.</p>
+            </div>
+            <button
+              v-if="can('logs_delete')"
+              class="text-link role-delete"
+              type="button"
+              :disabled="loadingAuditLogs"
+              @click="clearAuditLogs"
+            >
+              Protokoll löschen
+            </button>
+          </div>
+
+          <section class="panel-card management-card">
+            <div class="panel-heading">
+              <div>
+                <h2>Aktivitätsverlauf</h2>
+                <p>Es werden keine Passwörter, PINs oder Nachrichteninhalte gespeichert.</p>
+              </div>
+            </div>
+            <div class="table-scroll">
+              <table class="management-table">
+                <thead>
+                  <tr><th>ZEITPUNKT</th><th>PERSON</th><th>AKTION</th><th>BEREICH</th><th>REFERENZ</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="entry in auditLogs" :key="entry.id">
+                    <td>{{ formatAuditTimestamp(entry.createdAt) }}</td>
+                    <td class="product-name">{{ entry.actorName }}</td>
+                    <td>{{ entry.action }}</td>
+                    <td>{{ entry.resource }}</td>
+                    <td>{{ entry.resourceId ?? '—' }}</td>
+                  </tr>
+                  <tr v-if="auditLogs.length === 0">
+                    <td class="empty-result" colspan="5">
+                      {{ loadingAuditLogs ? 'Protokolle werden geladen …' : 'Noch keine Protokolleinträge vorhanden.' }}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <button
+              v-if="auditLogsHasMore"
+              class="secondary-button load-more-button"
+              type="button"
+              :disabled="loadingAuditLogs"
+              @click="loadAuditLogs(true)"
+            >
+              {{ loadingAuditLogs ? 'Wird geladen …' : 'Weitere Einträge laden' }}
+            </button>
           </section>
         </template>
 
