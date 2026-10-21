@@ -114,6 +114,71 @@ function appDatabase(): PDO
     }
 
     $database->exec(
+        'CREATE TABLE IF NOT EXISTS access_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code_hash TEXT NOT NULL UNIQUE,
+            code_type TEXT NOT NULL CHECK (code_type IN (\'access\', \'seller\')),
+            group_name TEXT NOT NULL DEFAULT \'Unsortiert\',
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            revoked_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+    $accessCodeColumns = $database->query('PRAGMA table_info(access_codes)')->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('group_name', $accessCodeColumns, true)) {
+        $database->exec("ALTER TABLE access_codes ADD COLUMN group_name TEXT NOT NULL DEFAULT 'Unsortiert'");
+    }
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS auction_profiles (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            seller_code_id INTEGER REFERENCES access_codes(id) ON DELETE SET NULL
+        )'
+    );
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS auctions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            starting_price_cents INTEGER NOT NULL CHECK (starting_price_cents > 0),
+            current_bid_cents INTEGER NOT NULL CHECK (current_bid_cents > 0),
+            highest_bidder_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            is_approved INTEGER NOT NULL DEFAULT 1 CHECK (is_approved IN (0, 1)),
+            ends_at TEXT,
+            status TEXT NOT NULL DEFAULT \'active\' CHECK (status IN (\'active\', \'closed\')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+    $auctionColumns = $database->query('PRAGMA table_info(auctions)')->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('is_approved', $auctionColumns, true)) {
+        $database->exec('ALTER TABLE auctions ADD COLUMN is_approved INTEGER NOT NULL DEFAULT 1 CHECK (is_approved IN (0, 1))');
+    }
+    if (!in_array('ends_at', $auctionColumns, true)) {
+        $database->exec('ALTER TABLE auctions ADD COLUMN ends_at TEXT');
+    }
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS auction_bids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            auction_id INTEGER NOT NULL REFERENCES auctions(id) ON DELETE CASCADE,
+            bidder_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+    $database->exec(
+        'CREATE TABLE IF NOT EXISTS user_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            auction_id INTEGER REFERENCES auctions(id) ON DELETE SET NULL,
+            message TEXT NOT NULL,
+            is_read INTEGER NOT NULL DEFAULT 0 CHECK (is_read IN (0, 1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )'
+    );
+
+    $database->exec(
         'CREATE TABLE IF NOT EXISTS notice_sections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL COLLATE NOCASE UNIQUE,

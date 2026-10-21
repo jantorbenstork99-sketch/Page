@@ -94,7 +94,21 @@ function publicUser(PDO $database, int $id): ?array
         'roleId' => $user['role_id'],
         'roleName' => $user['role_name'],
         'permissions' => $permissionsStatement->fetchAll(PDO::FETCH_COLUMN),
+        'isAdmin' => $user['role_id'] === 'admin',
+        'canSell' => sellerAccessIsActive($database, (int) $user['id']),
     ];
+}
+
+function sellerAccessIsActive(PDO $database, int $userId): bool
+{
+    $statement = $database->prepare(
+        'SELECT 1 FROM auction_profiles
+         JOIN access_codes ON access_codes.id = auction_profiles.seller_code_id
+         WHERE auction_profiles.user_id = :user_id
+           AND access_codes.code_type = \'seller\' AND access_codes.revoked_at IS NULL'
+    );
+    $statement->execute(['user_id' => $userId]);
+    return $statement->fetchColumn() !== false;
 }
 
 function requirePermission(?array $user, string ...$permissions): array
@@ -216,10 +230,186 @@ function writeAuditLog(PDO $database, array $actor, string $action, string $reso
     ]);
 }
 
+function expireAuctions(PDO $database): void
+{
+    $expired = $database->query(
+        'SELECT id, seller_id, highest_bidder_id, title
+         FROM auctions
+         WHERE status = \'active\' AND is_approved = 1
+           AND ends_at IS NOT NULL AND ends_at <= CURRENT_TIMESTAMP'
+    )->fetchAll();
+    if ($expired === []) {
+        return;
+    }
+
+    $database->beginTransaction();
+    try {
+        $close = $database->prepare(
+            'UPDATE auctions SET status = \'closed\'
+             WHERE id = :id AND status = \'active\' AND ends_at <= CURRENT_TIMESTAMP'
+        );
+        $notifySeller = $database->prepare(
+            'INSERT INTO user_notifications (user_id, auction_id, message)
+             VALUES (:user_id, :auction_id, :message)'
+        );
+        foreach ($expired as $auction) {
+            $close->execute(['id' => $auction['id']]);
+            if ($close->rowCount() === 0) {
+                continue;
+            }
+            $sellerMessage = $auction['highest_bidder_id'] === null
+                ? 'Die Auktion „' . $auction['title'] . '“ ist beendet. Es gab keine Gebote.'
+                : 'Die Auktion „' . $auction['title'] . '“ ist beendet. Öffne deine Angebote, um Gewinner und Endgebot zu sehen.';
+            $notifySeller->execute([
+                'user_id' => $auction['seller_id'],
+                'auction_id' => $auction['id'],
+                'message' => $sellerMessage,
+            ]);
+            writeAuditLog($database, ['id' => null, 'name' => 'System'], 'Beendet', 'Roleplay-Auktion', (int) $auction['id']);
+        }
+        $database->commit();
+    } catch (Throwable $error) {
+        if ($database->inTransaction()) {
+            $database->rollBack();
+        }
+        throw $error;
+    }
+}
+
 try {
     $database = appDatabase();
     $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
     $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $notificationUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
+    $notificationUser = $notificationUserId === false || $notificationUserId === null
+        ? null
+        : publicUser($database, $notificationUserId);
+
+    if ($path === '/api/notifications' && $method === 'GET') {
+        $user = requireLogin($notificationUser);
+        $statement = $database->prepare(
+            'SELECT id, auction_id AS auctionId, message, is_read AS isRead, created_at AS createdAt
+             FROM user_notifications WHERE user_id = :user_id
+             ORDER BY id DESC LIMIT 100'
+        );
+        $statement->execute(['user_id' => $user['id']]);
+        $notifications = $statement->fetchAll();
+        $unreadCountStatement = $database->prepare(
+            'SELECT COUNT(*) FROM user_notifications WHERE user_id = :user_id AND is_read = 0'
+        );
+        $unreadCountStatement->execute(['user_id' => $user['id']]);
+        $unreadCount = (int) $unreadCountStatement->fetchColumn();
+        foreach ($notifications as &$notification) {
+            $notification['id'] = (int) $notification['id'];
+            $notification['auctionId'] = $notification['auctionId'] === null ? null : (int) $notification['auctionId'];
+            $notification['isRead'] = (bool) $notification['isRead'];
+        }
+        unset($notification);
+        respond(['notifications' => $notifications, 'unreadCount' => $unreadCount]);
+    }
+
+    if (preg_match('#^/api/notifications/(\d+)/read$#D', (string) $path, $notificationMatch) === 1 && $method === 'POST') {
+        $user = requireLogin($notificationUser);
+        verifyCsrfToken();
+        $markRead = $database->prepare(
+            'UPDATE user_notifications SET is_read = 1 WHERE id = :id AND user_id = :user_id'
+        );
+        $markRead->execute(['id' => (int) $notificationMatch[1], 'user_id' => $user['id']]);
+        if ($markRead->rowCount() === 0) {
+            $exists = $database->prepare(
+                'SELECT 1 FROM user_notifications WHERE id = :id AND user_id = :user_id AND is_read = 1'
+            );
+            $exists->execute(['id' => (int) $notificationMatch[1], 'user_id' => $user['id']]);
+            if ($exists->fetchColumn() === false) {
+                respond(['error' => 'Die Nachricht wurde nicht gefunden.'], 404);
+            }
+        }
+        respond(['message' => 'Nachricht als gelesen markiert.']);
+    }
+
+    if ($path === '/api/access-login' && $method === 'POST') {
+        verifyCsrfToken();
+        $body = requestBody();
+        $code = is_string($body['code'] ?? null) ? strtoupper(trim($body['code'])) : '';
+        $name = is_string($body['name'] ?? null) ? trim($body['name']) : '';
+        if (preg_match('/\A(?:MIT|VER|NACHT)-[A-F0-9]{8}\z/D', $code) !== 1 || preg_match('/\A.{2,32}\z/us', $name) !== 1) {
+            respond(['error' => 'Bitte prüfe deinen Zugangscode und Decknamen.'], 422);
+        }
+
+        $database->exec('BEGIN IMMEDIATE');
+        try {
+            $codeStatement = $database->prepare(
+                'SELECT id, user_id, code_type FROM access_codes
+                 WHERE code_hash = :code_hash AND revoked_at IS NULL'
+            );
+            $codeStatement->execute(['code_hash' => hash('sha256', $code)]);
+            $codeRecord = $codeStatement->fetch();
+            if ($codeRecord === false) {
+                $database->rollBack();
+                respond(['error' => 'Der Zugangscode ist ungültig oder wurde gesperrt.'], 401);
+            }
+
+            $userId = $codeRecord['user_id'] === null ? null : (int) $codeRecord['user_id'];
+            if ($userId === null) {
+                $username = 'guest_' . (int) $codeRecord['id'];
+                $insertUser = $database->prepare(
+                    'INSERT INTO users (name, username, password_hash, role_id)
+                     VALUES (:name, :username, :password_hash, \'employee\')'
+                );
+                $insertUser->execute([
+                    'name' => $name,
+                    'username' => $username,
+                    'password_hash' => password_hash(bin2hex(random_bytes(32)), PASSWORD_DEFAULT),
+                ]);
+                $userId = (int) $database->lastInsertId();
+                $bindCode = $database->prepare('UPDATE access_codes SET user_id = :user_id WHERE id = :id');
+                $bindCode->execute(['user_id' => $userId, 'id' => $codeRecord['id']]);
+                $createProfile = $database->prepare(
+                    'INSERT INTO auction_profiles (user_id, seller_code_id) VALUES (:user_id, :seller_code_id)'
+                );
+                $createProfile->execute([
+                    'user_id' => $userId,
+                    'seller_code_id' => $codeRecord['code_type'] === 'seller' ? $codeRecord['id'] : null,
+                ]);
+            } elseif ($codeRecord['code_type'] === 'seller') {
+                if ($codeRecord['user_id'] !== null && (int) $codeRecord['user_id'] !== $userId) {
+                    $database->rollBack();
+                    respond(['error' => 'Dieser Verkäufer-Code wurde bereits einem anderen Konto zugeordnet.'], 401);
+                }
+                $bindSellerCode = $database->prepare('UPDATE access_codes SET user_id = :user_id WHERE id = :id');
+                $bindSellerCode->execute(['user_id' => $userId, 'id' => $codeRecord['id']]);
+                $saveProfile = $database->prepare(
+                    'INSERT INTO auction_profiles (user_id, seller_code_id) VALUES (:user_id, :code_id)
+                     ON CONFLICT(user_id) DO UPDATE SET seller_code_id = excluded.seller_code_id'
+                );
+                $saveProfile->execute(['user_id' => $userId, 'code_id' => $codeRecord['id']]);
+            }
+            $activeUser = $database->prepare('SELECT is_active FROM users WHERE id = :id');
+            $activeUser->execute(['id' => $userId]);
+            if ((int) $activeUser->fetchColumn() !== 1) {
+                $database->rollBack();
+                respond(['error' => 'Dieser Zugang wurde gesperrt.'], 401);
+            }
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+
+        if (!session_regenerate_id(true)) {
+            throw new RuntimeException('Could not rotate the session identifier.');
+        }
+        $_SESSION['user_id'] = $userId;
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+        $loggedInUser = publicUser($database, $userId);
+        if ($loggedInUser === null) {
+            throw new RuntimeException('Authenticated account could not be loaded.');
+        }
+        writeAuditLog($database, $loggedInUser, 'Angemeldet', 'Roleplay-Netzwerk');
+        respond(['user' => $loggedInUser, 'csrfToken' => csrfToken()]);
+    }
 
     if ($path === '/api/session' && $method === 'GET') {
         $userId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
@@ -241,11 +431,11 @@ try {
             respond(['error' => 'Bitte prüfe deinen Benutzernamen und dein Passwort.'], 422);
         }
 
-        $statement = $database->prepare('SELECT id, password_hash, is_active FROM users WHERE username = :username COLLATE NOCASE');
+        $statement = $database->prepare('SELECT id, password_hash, role_id, is_active FROM users WHERE username = :username COLLATE NOCASE');
         $statement->execute(['username' => $username]);
         $userRecord = $statement->fetch();
 
-        if ($userRecord === false || (int) $userRecord['is_active'] !== 1 || !password_verify($password, $userRecord['password_hash'])) {
+        if ($userRecord === false || $userRecord['role_id'] !== 'admin' || (int) $userRecord['is_active'] !== 1 || !password_verify($password, $userRecord['password_hash'])) {
             respond(['error' => 'Benutzername oder Passwort ist nicht korrekt.'], 401);
         }
 
@@ -289,6 +479,495 @@ try {
 
     $sessionUserId = filter_var($_SESSION['user_id'] ?? null, FILTER_VALIDATE_INT);
     $currentUser = $sessionUserId === false || $sessionUserId === null ? null : publicUser($database, $sessionUserId);
+
+    if ($path === '/api/seller-access' && $method === 'POST') {
+        $user = requireLogin($currentUser);
+        verifyCsrfToken();
+        $body = requestBody();
+        $code = is_string($body['code'] ?? null) ? strtoupper(trim($body['code'])) : '';
+        if (preg_match('/\A(?:VER|NACHT)-[A-F0-9]{8}\z/D', $code) !== 1) {
+            respond(['error' => 'Bitte gib einen gültigen Verkäufer-Code ein.'], 422);
+        }
+        $database->exec('BEGIN IMMEDIATE');
+        try {
+            $codeStatement = $database->prepare(
+                'SELECT id, user_id FROM access_codes
+                 WHERE code_hash = :code_hash AND code_type = \'seller\' AND revoked_at IS NULL'
+            );
+            $codeStatement->execute(['code_hash' => hash('sha256', $code)]);
+            $codeRecord = $codeStatement->fetch();
+            if ($codeRecord === false || ($codeRecord['user_id'] !== null && (int) $codeRecord['user_id'] !== $user['id'])) {
+                $database->rollBack();
+                respond(['error' => 'Der Verkäufer-Code ist ungültig, gesperrt oder bereits verwendet.'], 401);
+            }
+            $bindCode = $database->prepare('UPDATE access_codes SET user_id = :user_id WHERE id = :id');
+            $bindCode->execute(['user_id' => $user['id'], 'id' => $codeRecord['id']]);
+            $saveProfile = $database->prepare(
+                'INSERT INTO auction_profiles (user_id, seller_code_id) VALUES (:user_id, :code_id)
+                 ON CONFLICT(user_id) DO UPDATE SET seller_code_id = excluded.seller_code_id'
+            );
+            $saveProfile->execute(['user_id' => $user['id'], 'code_id' => $codeRecord['id']]);
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+        $updatedUser = publicUser($database, $user['id']);
+        respond(['user' => $updatedUser]);
+    }
+
+    if ($path === '/api/access-codes' && $method === 'GET') {
+        if (!requireLogin($currentUser)['isAdmin']) {
+            respond(['error' => 'Diese Aktion ist nur dem Admin erlaubt.'], 403);
+        }
+        $codes = $database->query(
+            'SELECT access_codes.id, access_codes.code_type AS type, access_codes.group_name AS groupName,
+                    access_codes.revoked_at AS revokedAt,
+                    access_codes.created_at AS createdAt, users.name AS userName
+             FROM access_codes LEFT JOIN users ON users.id = access_codes.user_id
+             ORDER BY access_codes.group_name COLLATE NOCASE, access_codes.id DESC'
+        )->fetchAll();
+        foreach ($codes as &$code) {
+            $code['id'] = (int) $code['id'];
+            $code['revoked'] = $code['revokedAt'] !== null;
+        }
+        unset($code);
+        respond(['codes' => $codes]);
+    }
+
+    if ($path === '/api/access-codes' && $method === 'POST') {
+        if (!requireLogin($currentUser)['isAdmin']) {
+            respond(['error' => 'Diese Aktion ist nur dem Admin erlaubt.'], 403);
+        }
+        verifyCsrfToken();
+        $body = requestBody();
+        $type = $body['type'] ?? null;
+        $groupName = is_string($body['groupName'] ?? null) ? trim($body['groupName']) : '';
+        if (!in_array($type, ['access', 'seller'], true)) {
+            respond(['error' => 'Ungültiger Code-Typ.'], 422);
+        }
+        if ($groupName === '' || strlen($groupName) > 80) {
+            respond(['error' => 'Bitte gib eine gültige Roleplay-Gruppe an (maximal 80 Zeichen).'], 422);
+        }
+        $prefix = $type === 'seller' ? 'VER-' : 'MIT-';
+        $code = $prefix . strtoupper(bin2hex(random_bytes(4)));
+        $createCode = $database->prepare(
+            'INSERT INTO access_codes (code_hash, code_type, group_name, created_by)
+             VALUES (:hash, :type, :group_name, :created_by)'
+        );
+        $createCode->execute([
+            'hash' => hash('sha256', $code),
+            'type' => $type,
+            'group_name' => $groupName,
+            'created_by' => $currentUser['id'],
+        ]);
+        writeAuditLog($database, $currentUser, 'Erstellt', 'Zugangscode', (int) $database->lastInsertId());
+        respond(['code' => $code], 201);
+    }
+
+    if (preg_match('#^/api/access-codes/(\d+)$#D', (string) $path, $codeMatch) === 1 && $method === 'DELETE') {
+        if (!requireLogin($currentUser)['isAdmin']) {
+            respond(['error' => 'Diese Aktion ist nur dem Admin erlaubt.'], 403);
+        }
+        verifyCsrfToken();
+        $codeId = (int) $codeMatch[1];
+        $codeQuery = $database->prepare('SELECT code_type, user_id, revoked_at FROM access_codes WHERE id = :id');
+        $codeQuery->execute(['id' => $codeId]);
+        $codeRecord = $codeQuery->fetch();
+        if ($codeRecord === false) {
+            respond(['error' => 'Der Zugangscode wurde nicht gefunden.'], 404);
+        }
+        if ($codeRecord['revoked_at'] === null) {
+            $revoke = $database->prepare('UPDATE access_codes SET revoked_at = CURRENT_TIMESTAMP WHERE id = :id');
+            $revoke->execute(['id' => $codeId]);
+            if ($codeRecord['code_type'] === 'access' && $codeRecord['user_id'] !== null) {
+                $disableUser = $database->prepare('UPDATE users SET is_active = 0 WHERE id = :id');
+                $disableUser->execute(['id' => $codeRecord['user_id']]);
+            }
+            writeAuditLog($database, $currentUser, 'Gesperrt', 'Zugangscode', $codeId);
+        }
+        respond(['message' => 'Der Code wurde gesperrt.']);
+    }
+
+    if ($path === '/api/admin/logs' && $method === 'GET') {
+        $admin = requireLogin($currentUser);
+        if (!$admin['isAdmin']) {
+            respond(['error' => 'Diese Aktion ist nur dem Admin erlaubt.'], 403);
+        }
+
+        $beforeId = null;
+        if (isset($_GET['before'])) {
+            $beforeId = filter_var($_GET['before'], FILTER_VALIDATE_INT);
+            if ($beforeId === false || $beforeId === null || $beforeId < 1) {
+                respond(['error' => 'Ungültiger Protokoll-Cursor.'], 422);
+            }
+        }
+
+        $query = 'SELECT audit_logs.id, audit_logs.actor_name AS actorName, audit_logs.action,
+                         audit_logs.resource, audit_logs.resource_id AS resourceId,
+                         audit_logs.created_at AS createdAt,
+                         COALESCE(auctions.title, access_codes.group_name, \'\') AS detail
+                  FROM audit_logs
+                  LEFT JOIN auctions
+                    ON audit_logs.resource = \'Roleplay-Auktion\'
+                   AND CAST(audit_logs.resource_id AS INTEGER) = auctions.id
+                  LEFT JOIN access_codes
+                    ON audit_logs.resource = \'Zugangscode\'
+                   AND CAST(audit_logs.resource_id AS INTEGER) = access_codes.id';
+        if ($beforeId !== null) {
+            $query .= ' WHERE audit_logs.id < :before_id';
+        }
+        $query .= ' ORDER BY audit_logs.id DESC LIMIT 101';
+        $getLogs = $database->prepare($query);
+        $getLogs->execute($beforeId === null ? [] : ['before_id' => $beforeId]);
+        $logs = $getLogs->fetchAll();
+        $hasMore = count($logs) > 100;
+        if ($hasMore) {
+            array_pop($logs);
+        }
+        foreach ($logs as &$log) {
+            $log['id'] = (int) $log['id'];
+        }
+        unset($log);
+        respond([
+            'logs' => $logs,
+            'hasMore' => $hasMore,
+            'nextBefore' => $logs === [] ? null : $logs[array_key_last($logs)]['id'],
+        ]);
+    }
+
+    if ($path === '/api/auctions' && $method === 'GET') {
+        expireAuctions($database);
+        $viewer = requireLogin($currentUser);
+        $auctionQuery = 'SELECT auctions.id, auctions.seller_id AS sellerId, users.name AS sellerName,
+                    auctions.highest_bidder_id AS highestBidderId, winning_users.name AS buyerName,
+                    auctions.title, auctions.category, auctions.description,
+                    auctions.starting_price_cents AS startingPriceCents,
+                    auctions.current_bid_cents AS currentBidCents, auctions.status,
+                    auctions.is_approved AS isApproved, auctions.ends_at AS endsAt,
+                    auctions.created_at AS createdAt,
+                    (SELECT COUNT(*) FROM auction_bids WHERE auction_id = auctions.id) AS bidCount
+             FROM auctions JOIN users ON users.id = auctions.seller_id
+             LEFT JOIN users AS winning_users ON winning_users.id = auctions.highest_bidder_id
+             ';
+        if (!$viewer['isAdmin']) {
+            $auctionQuery .= 'WHERE auctions.is_approved = 1 ';
+        }
+        $auctionQuery .= 'ORDER BY CASE auctions.status WHEN \'active\' THEN 0 ELSE 1 END, auctions.id DESC';
+        $auctions = $database->query($auctionQuery)->fetchAll();
+        $auctionBids = [];
+        if ($viewer['isAdmin']) {
+            $bidQuery = $database->query(
+                'SELECT auction_bids.auction_id AS auctionId, users.name AS bidderName,
+                        auction_bids.amount_cents AS amountCents, auction_bids.created_at AS createdAt
+                 FROM auction_bids
+                 JOIN auctions ON auctions.id = auction_bids.auction_id
+                 JOIN users ON users.id = auction_bids.bidder_id
+                 WHERE auctions.status = \'active\' AND auctions.is_approved = 1
+                 ORDER BY auction_bids.auction_id, auction_bids.created_at DESC, auction_bids.id DESC'
+            );
+            foreach ($bidQuery->fetchAll() as $bid) {
+                $auctionId = (int) $bid['auctionId'];
+                $auctionBids[$auctionId] ??= [];
+                $auctionBids[$auctionId][] = [
+                    'bidderName' => $bid['bidderName'],
+                    'amount' => formatScaledInteger((int) $bid['amountCents'], 2),
+                    'createdAt' => str_replace(' ', 'T', $bid['createdAt']) . 'Z',
+                ];
+            }
+        }
+        foreach ($auctions as &$auction) {
+            $auction['id'] = (int) $auction['id'];
+            $auction['sellerId'] = (int) $auction['sellerId'];
+            $auction['startingPrice'] = formatScaledInteger((int) $auction['startingPriceCents'], 2);
+            $auction['currentBid'] = formatScaledInteger((int) $auction['currentBidCents'], 2);
+            $auction['bidCount'] = (int) $auction['bidCount'];
+            $auction['isApproved'] = (bool) $auction['isApproved'];
+            $auction['endsAt'] = $auction['endsAt'] === null
+                ? null
+                : str_replace(' ', 'T', $auction['endsAt']) . 'Z';
+            if ($viewer['isAdmin'] && $auction['status'] === 'active' && $auction['isApproved']) {
+                $auction['bids'] = $auctionBids[$auction['id']] ?? [];
+            }
+            if ($auction['status'] === 'closed' && ($viewer['isAdmin'] || $auction['sellerId'] === $viewer['id'])) {
+                $auction['buyerName'] = $auction['highestBidderId'] === null ? null : $auction['buyerName'];
+                $auction['soldAmount'] = $auction['highestBidderId'] === null ? null : $auction['currentBid'];
+            } else {
+                unset($auction['buyerName']);
+            }
+            unset($auction['highestBidderId']);
+            unset($auction['startingPriceCents'], $auction['currentBidCents']);
+        }
+        unset($auction);
+        respond(['auctions' => $auctions]);
+    }
+
+    if ($path === '/api/auctions' && $method === 'POST') {
+        $seller = requireLogin($currentUser);
+        if (!$seller['canSell']) {
+            respond(['error' => 'Für das Einstellen von Angeboten wird ein aktiver Verkäufer-Code benötigt.'], 403);
+        }
+        verifyCsrfToken();
+        $body = requestBody();
+        $title = is_string($body['title'] ?? null) ? trim($body['title']) : '';
+        $category = is_string($body['category'] ?? null) ? trim($body['category']) : '';
+        $description = is_string($body['description'] ?? null) ? trim($body['description']) : '';
+        $priceCents = decimalToScaledInteger($body['startingPrice'] ?? null, 8, 2);
+        if ($title === '' || strlen($title) > 240 || !in_array($category, ['Waffen', 'Drogen'], true)
+            || strlen($description) > 4000 || $priceCents === null || $priceCents < 1) {
+            respond(['error' => 'Bitte prüfe Titel, Kategorie, Beschreibung und Startgebot.'], 422);
+        }
+        $createAuction = $database->prepare(
+            'INSERT INTO auctions (seller_id, title, category, description, starting_price_cents, current_bid_cents, is_approved)
+             VALUES (:seller_id, :title, :category, :description, :price, :price, 0)'
+        );
+        $createAuction->execute([
+            'seller_id' => $seller['id'],
+            'title' => $title,
+            'category' => $category,
+            'description' => $description,
+            'price' => $priceCents,
+        ]);
+        $auctionId = (int) $database->lastInsertId();
+        writeAuditLog($database, $seller, 'Eingereicht', 'Roleplay-Auktion', $auctionId);
+        respond(['auctionId' => $auctionId, 'message' => 'Angebot wurde zur Freigabe eingereicht.'], 201);
+    }
+
+    if ($path === '/api/auctions/approve-all' && $method === 'POST') {
+        $admin = requireLogin($currentUser);
+        if (!$admin['isAdmin']) {
+            respond(['error' => 'Nur der Admin darf Auktionen freigeben.'], 403);
+        }
+        verifyCsrfToken();
+        $pending = $database->query(
+            'SELECT id FROM auctions WHERE is_approved = 0 AND status = \'active\' ORDER BY id'
+        )->fetchAll(PDO::FETCH_COLUMN);
+        if ($pending === []) {
+            respond(['approvedCount' => 0, 'message' => 'Es warten keine Angebote auf Freigabe.']);
+        }
+        $database->beginTransaction();
+        try {
+            $approve = $database->prepare(
+                'UPDATE auctions SET is_approved = 1 WHERE id = :id AND is_approved = 0 AND status = \'active\''
+            );
+            $approvedCount = 0;
+            foreach ($pending as $auctionId) {
+                $approve->execute(['id' => $auctionId]);
+                if ($approve->rowCount() > 0) {
+                    $approvedCount++;
+                    writeAuditLog($database, $admin, 'Gestartet', 'Roleplay-Auktion', (int) $auctionId);
+                }
+            }
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+        respond([
+            'approvedCount' => $approvedCount,
+            'message' => $approvedCount . ($approvedCount === 1 ? ' Auktion wurde gestartet.' : ' Auktionen wurden gestartet.'),
+        ]);
+    }
+
+    if ($path === '/api/auctions/end-all' && $method === 'POST') {
+        $admin = requireLogin($currentUser);
+        if (!$admin['isAdmin']) {
+            respond(['error' => 'Nur der Admin darf Auktionen beenden.'], 403);
+        }
+        verifyCsrfToken();
+        $body = requestBody();
+        $durationSeconds = filter_var($body['durationSeconds'] ?? null, FILTER_VALIDATE_INT);
+        if ($durationSeconds === false || $durationSeconds < 10 || $durationSeconds > 86400) {
+            respond(['error' => 'Die letzte Gebotsphase muss zwischen 10 Sekunden und 24 Stunden dauern.'], 422);
+        }
+        $endsAt = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
+            ->modify('+' . $durationSeconds . ' seconds')
+            ->format('Y-m-d H:i:s');
+        $auctionsToEnd = $database->query(
+            'SELECT id, title FROM auctions WHERE status = \'active\' AND is_approved = 1 ORDER BY id'
+        )->fetchAll();
+        if ($auctionsToEnd === []) {
+            respond(['endedCount' => 0, 'message' => 'Aktuell laufen keine freigegebenen Auktionen.']);
+        }
+
+        $durationLabel = $durationSeconds % 60 === 0
+            ? intdiv($durationSeconds, 60) . (intdiv($durationSeconds, 60) === 1 ? ' Minute' : ' Minuten')
+            : $durationSeconds . ' Sekunden';
+        $database->beginTransaction();
+        try {
+            $startClosing = $database->prepare(
+                'UPDATE auctions SET ends_at = :ends_at
+                 WHERE id = :id AND status = \'active\' AND is_approved = 1'
+            );
+            $notifyBidders = $database->prepare(
+                'INSERT INTO user_notifications (user_id, auction_id, message)
+                 SELECT DISTINCT bidder_id, :notification_auction_id, :message
+                 FROM auction_bids WHERE auction_id = :bid_auction_id'
+            );
+            $endedCount = 0;
+            foreach ($auctionsToEnd as $auction) {
+                $auctionId = (int) $auction['id'];
+                $startClosing->execute(['ends_at' => $endsAt, 'id' => $auctionId]);
+                if ($startClosing->rowCount() === 0) {
+                    continue;
+                }
+                $notifyBidders->execute([
+                    'notification_auction_id' => $auctionId,
+                    'message' => 'Letzte Gebotsphase: „' . $auction['title'] . '“ endet in ' . $durationLabel . '. Gib jetzt dein letztes Gebot ab.',
+                    'bid_auction_id' => $auctionId,
+                ]);
+                writeAuditLog($database, $admin, 'Letzte Gebotsphase gestartet', 'Roleplay-Auktion', $auctionId);
+                $endedCount++;
+            }
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+        respond([
+            'endedCount' => $endedCount,
+            'message' => $endedCount . ($endedCount === 1
+                ? ' Auktion läuft jetzt in der letzten Gebotsphase.'
+                : ' Auktionen laufen jetzt in der letzten Gebotsphase.'),
+        ]);
+    }
+
+    if (preg_match('#^/api/auctions/(\d+)/bid$#D', (string) $path, $bidMatch) === 1 && $method === 'POST') {
+        $bidder = requireLogin($currentUser);
+        verifyCsrfToken();
+        $body = requestBody();
+        $amountCents = decimalToScaledInteger($body['amount'] ?? null, 8, 2);
+        if ($amountCents === null || $amountCents < 1) {
+            respond(['error' => 'Bitte gib ein gültiges Gebot ein.'], 422);
+        }
+        $auctionId = (int) $bidMatch[1];
+        expireAuctions($database);
+        $database->exec('BEGIN IMMEDIATE');
+        try {
+            $auctionStatement = $database->prepare(
+                'SELECT seller_id, highest_bidder_id, current_bid_cents, status, is_approved, title, ends_at
+                 FROM auctions WHERE id = :id'
+            );
+            $auctionStatement->execute(['id' => $auctionId]);
+            $auction = $auctionStatement->fetch();
+            if ($auction === false || $auction['status'] !== 'active' || (int) $auction['is_approved'] !== 1
+                || ($auction['ends_at'] !== null && strtotime($auction['ends_at'] . ' UTC') <= time())) {
+                $database->rollBack();
+                respond(['error' => 'Diese Auktion ist nicht mehr verfügbar.'], 409);
+            }
+            if ((int) $auction['seller_id'] === $bidder['id']) {
+                $database->rollBack();
+                respond(['error' => 'Auf dein eigenes Angebot kannst du nicht bieten.'], 403);
+            }
+            if ($amountCents <= (int) $auction['current_bid_cents']) {
+                $database->rollBack();
+                respond(['error' => 'Dein Gebot muss höher als das aktuelle Gebot sein.'], 422);
+            }
+            $updateAuction = $database->prepare(
+                'UPDATE auctions SET current_bid_cents = :amount, highest_bidder_id = :bidder_id WHERE id = :id'
+            );
+            $updateAuction->execute(['amount' => $amountCents, 'bidder_id' => $bidder['id'], 'id' => $auctionId]);
+            $saveBid = $database->prepare(
+                'INSERT INTO auction_bids (auction_id, bidder_id, amount_cents) VALUES (:auction_id, :bidder_id, :amount)'
+            );
+            $saveBid->execute(['auction_id' => $auctionId, 'bidder_id' => $bidder['id'], 'amount' => $amountCents]);
+            if ($auction['highest_bidder_id'] !== null && (int) $auction['highest_bidder_id'] !== $bidder['id']) {
+                $insertNotification = $database->prepare(
+                    'INSERT INTO user_notifications (user_id, auction_id, message)
+                     VALUES (:user_id, :auction_id, :message)'
+                );
+                $insertNotification->execute([
+                    'user_id' => (int) $auction['highest_bidder_id'],
+                    'auction_id' => $auctionId,
+                    'message' => 'Du wurdest bei „' . $auction['title'] . '“ überboten. Das neue Gebot liegt bei ' . formatScaledInteger($amountCents, 2) . ' USD.',
+                ]);
+            }
+            $database->commit();
+        } catch (Throwable $error) {
+            if ($database->inTransaction()) {
+                $database->rollBack();
+            }
+            throw $error;
+        }
+        writeAuditLog($database, $bidder, 'Geboten', 'Roleplay-Auktion', $auctionId);
+        respond(['message' => 'Gebot wurde abgegeben.']);
+    }
+
+    if (preg_match('#^/api/auctions/(\d+)$#D', (string) $path, $auctionMatch) === 1 && $method === 'PATCH') {
+        $user = requireLogin($currentUser);
+        verifyCsrfToken();
+        $body = requestBody();
+        $targetStatus = $body['status'] ?? null;
+        if (!in_array($targetStatus, ['active', 'closed', 'ending'], true)) {
+            respond(['error' => 'Ungültiger Auktionsstatus.'], 422);
+        }
+        $auctionId = (int) $auctionMatch[1];
+        $auctionStatement = $database->prepare(
+            'SELECT is_approved, status, ends_at, title, highest_bidder_id
+             FROM auctions WHERE id = :id'
+        );
+        $auctionStatement->execute(['id' => $auctionId]);
+        $auction = $auctionStatement->fetch();
+        if ($auction === false) {
+            respond(['error' => 'Die Auktion wurde nicht gefunden.'], 404);
+        }
+        if (!$user['isAdmin']) {
+            respond(['error' => 'Nur der Admin darf Auktionen starten oder beenden.'], 403);
+        }
+
+        if ($targetStatus === 'active' && (int) $auction['is_approved'] === 0) {
+            $startAuction = $database->prepare(
+                'UPDATE auctions SET is_approved = 1, status = \'active\' WHERE id = :id'
+            );
+            $startAuction->execute(['id' => $auctionId]);
+            writeAuditLog($database, $user, 'Gestartet', 'Roleplay-Auktion', $auctionId);
+        } elseif ($targetStatus === 'ending' && $auction['status'] === 'active'
+            && (int) $auction['is_approved'] === 1 && $auction['ends_at'] === null) {
+            $durationSeconds = filter_var($body['durationSeconds'] ?? null, FILTER_VALIDATE_INT);
+            if ($durationSeconds === false || $durationSeconds < 10 || $durationSeconds > 86400) {
+                respond(['error' => 'Die letzte Gebotsphase muss zwischen 10 Sekunden und 24 Stunden dauern.'], 422);
+            }
+            $endsAt = (new DateTimeImmutable('now', new DateTimeZone('UTC')))
+                ->modify('+' . $durationSeconds . ' seconds')
+                ->format('Y-m-d H:i:s');
+            $startClosing = $database->prepare('UPDATE auctions SET ends_at = :ends_at WHERE id = :id');
+            $startClosing->execute(['ends_at' => $endsAt, 'id' => $auctionId]);
+            $notifyBidders = $database->prepare(
+                'INSERT INTO user_notifications (user_id, auction_id, message)
+                 SELECT DISTINCT bidder_id, :notification_auction_id, :message
+                 FROM auction_bids WHERE auction_id = :bid_auction_id'
+            );
+            $durationLabel = $durationSeconds % 60 === 0
+                ? intdiv($durationSeconds, 60) . (intdiv($durationSeconds, 60) === 1 ? ' Minute' : ' Minuten')
+                : $durationSeconds . ' Sekunden';
+            $notifyBidders->execute([
+                'notification_auction_id' => $auctionId,
+                'message' => 'Letzte Gebotsphase: „' . $auction['title'] . '“ endet in ' . $durationLabel . '. Gib jetzt dein letztes Gebot ab.',
+                'bid_auction_id' => $auctionId,
+            ]);
+            writeAuditLog($database, $user, 'Letzte Gebotsphase gestartet', 'Roleplay-Auktion', $auctionId);
+            respond([
+                'message' => 'Letzte Gebotsphase gestartet. Die Bieter wurden benachrichtigt.',
+                'endsAt' => str_replace(' ', 'T', $endsAt) . 'Z',
+            ]);
+        } elseif ($targetStatus === 'closed' && $auction['status'] === 'active' && (int) $auction['is_approved'] === 1) {
+            if ($auction['ends_at'] !== null && strtotime($auction['ends_at'] . ' UTC') > time()) {
+                respond(['error' => 'Die letzte Gebotsphase läuft noch. Die Auktion endet automatisch nach dem Countdown.'], 409);
+            }
+            $closeAuction = $database->prepare('UPDATE auctions SET status = \'closed\', ends_at = NULL WHERE id = :id');
+            $closeAuction->execute(['id' => $auctionId]);
+            writeAuditLog($database, $user, 'Beendet', 'Roleplay-Auktion', $auctionId);
+        } else {
+            respond(['error' => 'Diese Auktion kann in ihrem aktuellen Status nicht geändert werden.'], 409);
+        }
+        respond(['message' => $targetStatus === 'active' ? 'Die Auktion wurde gestartet.' : 'Die Auktion wurde beendet.']);
+    }
 
     if ($path === '/api/logs' && $method === 'GET') {
         requirePermission($currentUser, 'logs_view');
