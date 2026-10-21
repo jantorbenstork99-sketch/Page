@@ -58,7 +58,7 @@ const filteredAuditLogs = computed(() => {
       .some((value) => String(value).toLocaleLowerCase('de').includes(query)),
   )
 })
-const auctionLogCount = computed(() => auditLogs.value.filter((entry) => entry.resource === 'Roleplay-Auktion').length)
+const auctionLogCount = computed(() => auditLogs.value.filter((entry) => entry.resource === 'Auktion').length)
 const loginLogCount = computed(() => auditLogs.value.filter((entry) => entry.action === 'Angemeldet').length)
 const money = (value) => new Intl.NumberFormat('de-DE', { style: 'currency', currency: 'USD' }).format(Number(value || 0))
 const date = (value) => new Intl.DateTimeFormat('de-DE', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value.endsWith('Z') ? value : `${value.replace(' ', 'T')}Z`))
@@ -377,7 +377,7 @@ onMounted(() => {
       Promise.all([refreshAuctions(), refreshNotifications()])
         .catch((requestError) => { error.value = requestError.message })
     }
-  }, 10000)
+  }, 4000)
 })
 
 onUnmounted(() => {
@@ -401,7 +401,7 @@ onUnmounted(() => {
       </a>
       <p class="kicker">GESCHLOSSENES NETZWERK <i></i></p>
       <h1>Der Markt<br />öffnet sich <em>erst nach Einbruch der Nacht.</em></h1>
-      <p class="gate-description">Ein privater Marktplatz für fiktive Güter und Geschichten. Der Zugang ist nur mit persönlichem Code möglich.</p>
+      <p class="gate-description">Ein privater Marktplatz für Güter und Geschichten. Der Zugang ist nur mit persönlichem Code möglich.</p>
       <div class="auth-switch">
         <button :class="{ selected: authMode === 'code' }" type="button" @click="authMode = 'code'">Mit Zugangscode</button>
         <button :class="{ selected: authMode === 'admin' }" type="button" @click="authMode = 'admin'">Admin</button>
@@ -474,7 +474,7 @@ onUnmounted(() => {
               <div class="moon"></div><div class="orb orb-one"></div><div class="orb orb-two"></div>
               <div class="skyline skyline-back"><i v-for="n in 9" :key="`b${n}`"></i></div>
               <div class="skyline skyline-front"><i v-for="n in 8" :key="`f${n}`"></i></div>
-              <span class="art-label">NACHTHAFEN · SEIT 1998</span>
+              <span class="art-label">NACHTHAFEN</span>
               <span class="art-vertical">DEIN ZUGANG. DEINE GESCHICHTE.</span>
             </div>
             <div class="hero-count"><strong>{{ activeAuctions.length.toString().padStart(2, '0') }}</strong><span>AKTIVE<br />AUKTIONEN</span></div>
@@ -505,7 +505,7 @@ onUnmounted(() => {
                   <div class="bid-row"><div><small>AKTUELLES GEBOT</small><strong>{{ money(auction.currentBid) }}</strong></div><span v-if="auction.endsAt" class="market-countdown">LETZTE RUNDE · {{ auctionRemaining(auction) }}</span></div>
                   <form v-if="auction.sellerId !== session.id && !isAdmin" class="bid-form" @submit.prevent="placeBid(auction)">
                     <label class="sr-only" :for="`bid-${auction.id}`">Dein Gebot in US-Dollar</label>
-                    <input :id="`bid-${auction.id}`" v-model="bidValues[auction.id]" type="text" inputmode="decimal" pattern="[0-9]+([.,][0-9]{1,2})?" :placeholder="`Mind. ${money(auction.currentBid + 0.01)}`" required />
+                    <input :id="`bid-${auction.id}`" v-model="bidValues[auction.id]" type="text" inputmode="decimal" pattern="[0-9]+([.,][0-9]{1,2})?" :placeholder="`Mind. ${money(Number(auction.currentBid) + 0.01)}`" required />
                     <button class="button-primary" type="submit" :disabled="busy">Bieten <span>↗</span></button>
                   </form>
                   <div v-else-if="isAdmin" class="own-listing"><span>Admin-Steuerung</span><button type="button" @click="activeTab = 'auction-control'">Auktion beenden</button></div>
@@ -639,7 +639,7 @@ onUnmounted(() => {
             <div class="section-heading compact"><div><p class="kicker">NEUEN CODE ERSTELLEN</p><h2>Einladung ausstellen</h2></div></div>
             <form class="code-create-form" @submit.prevent="createCode">
               <label>Code-Typ<select v-model="newCodeType"><option value="access">Mitglieder-Zugang (MIT-)</option><option value="seller">Verkäufer-Zugang (VER-)</option></select></label>
-              <label class="group-field">Roleplay-Gruppe<span class="group-field-hint">Gruppennamen eintragen</span><span class="group-input-wrap"><span aria-hidden="true">⌘</span><input class="group-name-input" v-model.trim="newCodeGroup" maxlength="80" placeholder="Gruppennamen eingeben …" required /></span></label>
+              <label class="group-field">Gruppenname<span class="group-field-hint">Gruppennamen eintragen</span><span class="group-input-wrap"><span aria-hidden="true">⌘</span><input class="group-name-input" v-model.trim="newCodeGroup" maxlength="80" placeholder="Gruppennamen eingeben …" required /></span></label>
               <button class="button-primary" type="submit" :disabled="!newCodeGroup.trim()">Code erstellen <span>＋</span></button>
             </form>
             <div v-if="newCode" class="new-code-result"><div><span>DEIN NEUER CODE — EINMALIG SICHTBAR</span><code>{{ newCode }}</code></div><button type="button" @click="copyCode">Kopieren</button></div>
@@ -659,7 +659,6 @@ onUnmounted(() => {
               <p v-if="!accessCodes.length" class="empty-copy">Noch keine Zugangscodes erstellt.</p>
             </div>
           </section>
-          <section class="admin-note"><strong>Admin-Zugang</strong><span>Der Admin-Zugang erfolgt über das Admin-Konto, das über <code>php backend/create-user.php</code> eingerichtet wird. Codes werden nur gehasht gespeichert.</span></section>
         </template>
 
         <template v-else-if="activeTab === 'logs' && isAdmin">
@@ -701,7 +700,7 @@ onUnmounted(() => {
           </section>
         </template>
       </div>
-      <footer class="site-footer"><span>© NACHTHAFEN · FIKTIONALE ROLEPLAY-WELT</span><span>ALLES HIER IST ERFUNDEN.</span></footer>
+      <footer class="site-footer"><span>© NACHTHAFEN</span></footer>
     </section>
   </main>
 </template>
